@@ -2,7 +2,7 @@
 
 [package]
 name = "secc"
-version = "0.0.1"
+version = "0.0.5"
 edition = "2018"
 authors = ["Robert Simmons Jr. MSc."]
 license = "Apache-2.0"
