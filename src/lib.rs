@@ -651,11 +651,18 @@ pub fn create_with_arcs<T: Sync + Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::*;
     use log::info;
+    use log::LevelFilter;
     use std::sync::MutexGuard;
     use std::thread;
     use std::time::Duration;
+
+    pub fn init_test_log() {
+        let _ = env_logger::builder()
+            .filter_level(LevelFilter::Debug)
+            .is_test(true)
+            .try_init();
+    }
 
     /// A macro to assert that pointers point to the right nodes.
     macro_rules! assert_pointer_nodes {

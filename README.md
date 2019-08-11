@@ -42,7 +42,9 @@ physically.
 
 ### What's New
 * 2019-??-??: 0.0.1 
-  * Migration from Axiom. SECC has been split off from Axiom into its own micro crate.
+  * Migration from Axiom. SECC has been split off from Axiom into its own crate.
+
+[Release Notes for All Versions](https://github.com/rsimmonsjr/secc/blob/master/RELEASE_NOTES.md)
 
 ## Acknowledgements
 
