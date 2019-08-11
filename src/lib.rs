@@ -19,7 +19,7 @@
 //! this manner nodes are constantly cycled in and out of the queue so we only need to allocate
 //! them once when the channel is created.
 //!
-//! #Examples
+//! # Examples
 //! ```rust
 //! use secc::*;
 //!
