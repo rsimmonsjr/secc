@@ -27,6 +27,31 @@ sent to the channel the node moves from the head of the pool to the tail of the 
 this manner nodes are constantly cycled in and out of the queue so we only need to allocate
 them once when the channel is created.
 
+### Getting Started
+
+Using SECC is pretty simple as the following example shows. 
+
+```rust
+use secc::*;
+
+let channel = create::<u8>(5, 10);
+let (sender, receiver) = channel;
+assert_eq!(Ok(()), sender.send(17));
+assert_eq!(Ok(()), sender.send(19));
+assert_eq!(Ok(()), sender.send(23));
+assert_eq!(Ok(()), sender.send(29));
+assert_eq!(Ok(17), receiver.receive());
+assert_eq!(Ok(()), receiver.skip());
+assert_eq!(Ok(23), receiver.receive());
+assert_eq!(Ok(()), receiver.reset_skip());
+assert_eq!(Ok(19), receiver.receive());
+```
+
+This code creates the channel and then sends it a series of messages. The first is received 
+normally but then the user wants to skip the next message. The user can then receive in
+the middle of the channel, reset the skip and resume receiving normally. 
+
+
 ### Design Principals
 
 SECC was driven by the need for a multi-sender, multi-consumer channel that would have the ability
