@@ -1,6 +1,6 @@
-//! An Skip Enabled Concurrent Channel (SECC) is a bounded capacity channel that allows users
-//! to send and receive messages from multiple threads and allows the receiver to temporarily skip
-//! receiving messages if they desire.
+//! An Skip Enabled Concurrent Channel (SECC) is a bounded capacity channel that supports multiple
+//! senders and multiple recievers and allows the receiver to temporarily skip receiving messages
+//! if they desire.
 //!
 //! The channel is a FIFO structure unless the user intends to skip one or more messages
 //! in which case a message could be read in a different order. The channel does, however,
