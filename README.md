@@ -41,7 +41,7 @@ nodes. When send and receive operations happen, nodes are merely moved around lo
 physically.
 
 ### What's New
-* 2019-??-??: 0.0.1 
+* 2019-08-11: 0.0.5 
   * Migration from Axiom. SECC has been split off from Axiom into its own crate.
 
 [Release Notes for All Versions](https://github.com/rsimmonsjr/secc/blob/master/RELEASE_NOTES.md)
