@@ -211,6 +211,7 @@ pub struct SeccCore<T: Sync + Send> {
 }
 
 /// Sender side of the channel.
+#[derive(Clone)]
 pub struct SeccSender<T: Sync + Send> {
     /// The core of the channel.
     core: Arc<SeccCore<T>>,
@@ -329,6 +330,7 @@ unsafe impl<T: Send + Sync> Send for SeccSender<T> {}
 unsafe impl<T: Send + Sync> Sync for SeccSender<T> {}
 
 /// Receiver side of the channel.
+#[derive(Clone)]
 pub struct SeccReceiver<T: Sync + Send> {
     /// The core of the channel.
     core: Arc<SeccCore<T>>,
@@ -650,17 +652,6 @@ pub fn create<T: Sync + Send>(capacity: u16, poll_ms: u16) -> (SeccSender<T>, Se
     let receiver = SeccReceiver { core };
 
     (sender, receiver)
-}
-
-/// Creates the sender and receiver sides of this channel, wrapping each in an [`Arc`] and
-/// returns them as a tuple. The user can pass both a channel `capacity` and a `poll_ms` which
-/// govern how long operations that wait on the channel will poll.
-pub fn create_with_arcs<T: Sync + Send>(
-    capacity: u16,
-    poll_ms: u16,
-) -> (Arc<SeccSender<T>>, Arc<SeccReceiver<T>>) {
-    let (sender, receiver) = create(capacity, poll_ms);
-    (Arc::new(sender), Arc::new(receiver))
 }
 
 // --------------------- Test Cases ---------------------
@@ -1265,7 +1256,7 @@ mod tests {
         // receivers on different threads.
         let message_count = 200;
         let capacity = 32;
-        let (sender, receiver) = create_with_arcs::<u32>(capacity, 20);
+        let (sender, receiver) = create::<u32>(capacity, 20);
 
         let rx = thread::spawn(move || {
             let mut count = 0;
@@ -1294,7 +1285,7 @@ mod tests {
 
         // Test that if a user attempts to receive before a message is sent, he will be forced
         // to wait for the message.
-        let (sender, receiver) = create_with_arcs::<u32>(5, 20);
+        let (sender, receiver) = create::<u32>(5, 20);
         let receiver2 = receiver.clone();
         let mutex = Arc::new(Mutex::new(false));
         let rx_mutex = mutex.clone();
@@ -1339,7 +1330,7 @@ mod tests {
 
         // Tests that triggering send and receive as close to at the same time as possible does
         // not cause any race conditions.
-        let (sender, receiver) = create_with_arcs::<u32>(5, 20);
+        let (sender, receiver) = create::<u32>(5, 20);
         let receiver2 = receiver.clone();
         let pair = Arc::new((Mutex::new((false, false)), Condvar::new()));
         let rx_pair = pair.clone();
@@ -1396,7 +1387,7 @@ mod tests {
         // The channel size is intentionally small to force wait conditions.
         let message_count = 10000;
         let capacity = 10;
-        let (sender, receiver) = create_with_arcs::<u32>(capacity, 20);
+        let (sender, receiver) = create::<u32>(capacity, 20);
 
         let debug_if_needed = |core: Arc<SeccCore<u32>>| {
             if core.receivable.load(Ordering::Relaxed) > core.capacity {
