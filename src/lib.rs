@@ -802,6 +802,56 @@ mod tests {
     }
 
     #[test]
+    fn test_pop_while_peeking() {
+        // Tests that the user should not be able to pop while another thread is peeking at
+        // the data.
+        let (sender, receiver) = create::<Items>(5, 10);
+        let peeked = Arc::new((Mutex::new(false), Condvar::new()));
+        let popped = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let peeked_clone = peeked.clone();
+        let popped_clone = popped.clone();
+        let receiver_clone = receiver.clone();
+
+        sender.send(Items::A).unwrap();
+
+        let handle_peek = thread::spawn(move || {
+            let (ref mutex1, ref cvar1) = &*peeked_clone;
+            let mut ready = mutex1.lock().unwrap();
+            *ready = true;
+            let _item = receiver_clone.peek();
+            cvar1.notify_all();
+            drop(ready);
+
+            // Wait for the pop to occur.
+            let (ref mutex2, ref cvar2) = &*popped_clone;
+            let mut done = mutex2.lock().unwrap();
+            while !*done {
+                done = cvar2.wait(done).unwrap();
+            }
+            // Pop after someone already did should be an error.
+            assert_eq!(Err(SeccErrors::Empty), receiver_clone.pop());
+        });
+
+        let handle_pop = thread::spawn(move || {
+            let (ref mutex1, ref cvar1) = &*peeked;
+            let mut ready = mutex1.lock().unwrap();
+            while !*ready {
+                ready = cvar1.wait(ready).unwrap();
+            }
+
+            let (ref mutex2, ref cvar2) = &*popped;
+            let mut done = mutex2.lock().unwrap();
+            *done = true;
+            receiver.pop().unwrap();
+            cvar2.notify_all();
+        });
+
+        handle_pop.join().unwrap();
+        handle_peek.join().unwrap();
+    }
+
+    #[test]
     fn test_clone_with_unclonable() {
         // Issue #4 Prevents #[derive(Clone)] from being used because of a rust bug that
         // thinks it needs to clone the T type and required manual cloning. If not fixed this
