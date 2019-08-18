@@ -1,41 +1,37 @@
 language: rust
-
 notifications:
   email:
     on_success: never
-
-# Build only master and tagged releases
 branches:
   only:
-    - master
-    - /^v\d+\.\d+\.\d+(-\w*)?$/
-
+  - master
+  - "/^v\\d+\\.\\d+\\.\\d+(-\\w*)?$/"
 matrix:
   allow_failures:
-    - rust: nightly
+  - rust: nightly
   fast_finish: true
   include:
-    - rust: nightly
-      script:
-        - cargo test
-    - rust: beta
-      script:
-        - cargo test
-    - rust: stable
-      install:
-        - rustup component add rustfmt --toolchain stable-x86_64-unknown-linux-gnu
-      env:
-        - RUSTFLAGS="-D warnings"
-      script:
-        - cargo fmt -- --check
-        - cargo test
-        - cargo build
-        - cargo doc
-        - cargo package
-      deploy:
-        provider: cargo
-        on:
-          branch: master
-          tags: true
-        token:
-          secure: YYk39OlzmFzYUF7A0GpHV6DkC3ji7gqMa21O37hkE8s6pwa9eE8x9oGnzYYy5iPwJtEFNNICXcktc4yaeWHWxWRMORvQtO4hwxTu05lIa3BJBtS8ZyGT8jMFrVzRG07qU7lfFunANPPJwwhio9IhyyERiRct0yPsYtVIwJKNfhyYrjQ287AlSwGt6ZgNtvw353VsKf4brVh3L6QwzTt+G6lT4qlMXyNUz1ocUvwdfbWwFDQXKOKSiJDEpzf0g/bzM1Atpc0JNQat9VTPn22s/82C/+Gap2IiMQQkym2zX7ys/ct0R9PRP+6FF1R0apG897BXVdVZ9Zjtpuz+50KrHHueWueajbx8az2a1qsbJgRW5vQ75T5GShbZPEifZRK3ahiuLknv+8zv9IaqBPfowtCLEtyCBgxf+pVgH4y9ESab21cO9mm/6pEyKSt4lasqtPFHuxGWHxZ8vo6smZHOOyyqLptDXsdMnLjObOwEXoSSoHjpeOis0gDSuvJXV9agKEd1v7RknS+FDS7G2nzqFKly9BcIKUG6Yz7p6+WbiiJO/wg0FlldqcG2OSa9MqpMFGFN2AWCf1m0HHZ4wv6G7spKAIEdRHuVk3BxiH7z7aS4rrZ38guS9CCM12ytBVdyWMG3IqzP+uG5nRy5JSRDWiMVHdybcbHcY/luQVgQPQU=
+  - rust: nightly
+    script:
+    - cargo test
+  - rust: beta
+    script:
+    - cargo test
+  - rust: stable
+    install:
+    - rustup component add rustfmt --toolchain stable-x86_64-unknown-linux-gnu
+    env:
+    - RUSTFLAGS="-D warnings"
+    script:
+    - cargo fmt -- --check
+    - cargo test
+    - cargo build
+    - cargo doc
+    - cargo package
+    deploy:
+      provider: cargo
+      on:
+        branch: master
+        tags: true
+      token:
+        secure: UJCbPKdcu2zEDUvDao4Hx4NqiQBsfIeu+1cu73BS1Vh91tdDdvMmhD/QKs/bYV4n8Ufx5NeKQffzIz1MYO5Np31jQ1vIiPZbOBPtTKcF9evBxXI9fHW1PyNutW3SUgnVneFta6qU24VX+hKiRckm5+UD7weoZypfMhngWKs+gfsw/xlP3SyMgpuo18pHhQ6INZ6vtwv3uh8zqSQEm7dSxKAyWYfB0/9uVyn4ILINw7Onv1X9lhIVP7Yt06WBXqou8Y1hV6/4jXWw9VwyNn1A5v9zFXYG6s1WYi6PY+DzbWj1VTrE42Al8XhE7DH8W7/cXjVvF56aJMthySp4fnFHE7PkKhAQYaVcyqUc8JcSe82+6jDv2j5R3+QMRNROQrHibB7gZGdgxGGChOTSMQJgZJnZrq89hZdqfvmQ6jmAeaFsmggYufmTcun5fPFTp+/YABWYbOpUVXo9BvLNytoIM2AAXEkqVmPXTO4nlhKrUIc8k59Wl2ece31JsGdBiVp09r58Jy7UELXqJXzFKj3s6FPV5eJcLbbub/wDtKUkx98J1GDEY42eR58zfwscq/W8yhEUY4Fi5AiREvwIHYqL2BjcPOKv572vdxZ3GsmzjgMrdERgseG0Zbp/Ii5ULd2OcNMiXt4nSFjGglvTTw0G1rei8+hi9bbmTQ/urnxkfSQ=
