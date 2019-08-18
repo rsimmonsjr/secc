@@ -211,10 +211,19 @@ pub struct SeccCore<T: Sync + Send> {
 }
 
 /// Sender side of the channel.
-#[derive(Clone)]
 pub struct SeccSender<T: Sync + Send> {
     /// The core of the channel.
     core: Arc<SeccCore<T>>,
+}
+
+// Manual implementation necessary because of the following issue.
+// https://github.com/rust-lang/rust/issues/26925
+impl<T: Sync + Send> Clone for SeccSender<T> {
+    fn clone(&self) -> Self {
+        SeccSender {
+            core: self.core.clone(),
+        }
+    }
 }
 
 impl<T: Sync + Send> SeccSender<T> {
@@ -330,10 +339,19 @@ unsafe impl<T: Send + Sync> Send for SeccSender<T> {}
 unsafe impl<T: Send + Sync> Sync for SeccSender<T> {}
 
 /// Receiver side of the channel.
-#[derive(Clone)]
 pub struct SeccReceiver<T: Sync + Send> {
     /// The core of the channel.
     core: Arc<SeccCore<T>>,
+}
+
+// Manual implementation necessary because of the following issue.
+// https://github.com/rust-lang/rust/issues/26925
+impl<T: Sync + Send> Clone for SeccReceiver<T> {
+    fn clone(&self) -> Self {
+        SeccReceiver {
+            core: self.core.clone(),
+        }
+    }
 }
 
 impl<T: Sync + Send> SeccReceiver<T> {
@@ -814,6 +832,18 @@ mod tests {
         D,
         E,
         F,
+    }
+
+    #[test]
+    fn test_clone_with_unclonable() {
+        // Issue #4 Prevents #[derive(Clone)] from being used because of a rust bug that
+        // thinks it needs to clone the T type and required manual cloning. If not fixed this
+        // test wouldn't compile.
+        struct Unclonable {}
+
+        let (sender, receiver) = create::<Unclonable>(5, 10);
+        let _s_clone = sender.clone();
+        let _r_clone = receiver.clone();
     }
 
     #[test]
