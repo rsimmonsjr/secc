@@ -1,6 +1,6 @@
 # Release Notes
 
-* 2019-08-17: 0.0.7
+* 2019-08-17: 0.0.8
   * Fixing issue #4
 * 2019-08-17: 0.0.7
   * Removed `create_with_arcs()` function as `create()` is all that is needed now.
