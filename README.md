@@ -67,6 +67,8 @@ physically.
 
 ### What's New
 * 2019-08-17: 0.0.7
+  * Fixing issue #4
+* 2019-08-17: 0.0.7
   * Removed `create_with_arcs()` function as `create()` is all that is needed now.
   * Made SeccSender and SeccReceiver both clonable as they have internal `Arc`s. 
 
