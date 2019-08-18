@@ -4,34 +4,34 @@ notifications:
     on_success: never
 branches:
   only:
-  - master
-  - "/^v\\d+\\.\\d+\\.\\d+(-\\w*)?$/"
+    - master
+    - "/^v\\d+\\.\\d+\\.\\d+(-\\w*)?$/"
 matrix:
   allow_failures:
-  - rust: nightly
+    - rust: nightly
   fast_finish: true
   include:
-  - rust: nightly
-    script:
-    - cargo test
-  - rust: beta
-    script:
-    - cargo test
-  - rust: stable
-    install:
-    - rustup component add rustfmt --toolchain stable-x86_64-unknown-linux-gnu
-    env:
-    - RUSTFLAGS="-D warnings"
-    script:
-    - cargo fmt -- --check
-    - cargo test
-    - cargo build
-    - cargo doc
-    - cargo package
-    deploy:
-      provider: cargo
-      on:
-        branch: master
-        tags: true
-      token:
-        secure: Q4Y7/4xw3mNMzK//0LjPi3rLLGzOSVxZsCp0QFaDqdk5RS++j6X4DKD8blGJj5Qb4WUMSSzPp2nTFUpjnSU9PcQKvXfPTPnkYUCeZOBsPACbTA7XI5SCr6ApE4aVDEtBG6YTUByEPE01EGNsiUNrPns/ccpOd4qxE9l/hJLNM1u9BiwCqMiIb75R0s/W/fl3U3m/Ki4yLd6FkVH8q/IAXyyNQa4r/g2d7COTbC05l4WeOc+m4NJ6EQICLnPm2Gz3pbIIp5tJG+aefIRPnvdRjYq6nxQQNNtKuRoDnrRR77AITupT813PNkkgKXZj7w7RGSueZMg2v7DIT1ik2p6YIC8mTuUKEoOABuqsHc5+InMKdNa1ZnlBg0TggBEtx4psEgxqiF0GQ9eWJD7EJ9N9FwD3FGFjJKNpCxYl8SalshZBnIwMEfsa92patFHINa+4b6cCfMmG6fL7WC+9Q2LumJ9f+MUJqznBET6IxBx/WpS4iW5t2s6PkCnQqKIrhl1tIzTmf1xq768UdtngK/MbbUumLr+OwXMP06lVvGmZSS1exIVV/KQ2S0Pcb3oI1pTvn9lBWHnTzUApZ5HyxPOZo++wuxN/yy8Sj01flzpT2DAgoK95uQQR4mq2n9VAv6hU0KNrY7Tjmd9zYTcHCBNZx0wqRW1ItB7G8DK6xqnsJTw=
+    - rust: nightly
+      script:
+        - cargo test
+    - rust: beta
+      script:
+        - cargo test
+    - rust: stable
+      install:
+        - rustup component add rustfmt --toolchain stable-x86_64-unknown-linux-gnu
+      env:
+        - RUSTFLAGS="-D warnings"
+      script:
+        - cargo fmt -- --check
+        - cargo test
+        - cargo build
+        - cargo doc
+        - cargo package
+      deploy:
+        provider: cargo
+        on:
+          branch: master
+          tags: true
+        token:
+          secure: btf1djD7Bt5cZzqL/0zPD3TgwppJv2UmpbCJrfD0NNNADs89u/5C4GsF1mjufbOa0bKn/I05DZsL+Gn0xyzJNMdT4vcCkXO9pb0KNSbcSQHr28rl9CdnlFALmk1AgFH1QEpatVmniTxF1uqeMpjng0HHEvDaExLbjpW9nA4XeniLIFqAlfY/u9f+ASdXLSS0dTgdGO7oss7LmIrbDObbIcOansYCoYaemsr3lek10+NDE92PnwBaDdhoa8plTN7Wo1IvZAm1a23NhKA9Nyab4jVQRbzkL9zv9M2RKavanq4fAryRZr1C/KfDjb7JHyYvZMICUk59MlIeKPEB7XBqm25zmxP9J8rNaf7LFzO/8DDk2g/o1yF+D8ykLv6KWlts3SaBtXjHDC76jUDZNDDPH09KMq/YYpv7E6WI1fkFk1HAHpLeCkX/JAsAdj2HQunwDMqSKCsw2mxoYVcWYtAj6Ja686C9rOB5o9mx6oiRzPAI69QzUZXpMEaVMJT2z/jBbkmJiN9ps7eaGf88NaFWi2B+Am/vuh6YLKsVAzgXamGMGOChwuUstz9GeYTue6JT1UrO4gtivVJ2WHIW7eZjeaLMJZyfKh3yBJzzMQilowSlwnaadgodl5Xxkhj5cF8NEVIRJOwhROW+sapQePVoSzEaALijI3U5x9MsBYYSJuw=
