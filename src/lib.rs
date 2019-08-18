@@ -835,6 +835,18 @@ mod tests {
     }
 
     #[test]
+    fn test_clone_with_unclonable() {
+        // Issue #4 Prevents #[derive(Clone)] from being used because of a rust bug that
+        // thinks it needs to clone the T type and required manual cloning. If not fixed this
+        // test wouldn't compile.
+        struct Unclonable {}
+
+        let (sender, receiver) = create::<Unclonable>(5, 10);
+        let _s_clone = sender.clone();
+        let _r_clone = receiver.clone();
+    }
+
+    #[test]
     fn test_send_and_receive() {
         init_test_log();
 
