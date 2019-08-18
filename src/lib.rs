@@ -227,44 +227,44 @@ impl<T: Sync + Send> SeccSender<T> {
     /// an empty [`std::Result::Ok`] or an [`std::Result::Err`] containing the last message
     /// sent if something went wrong.
     pub fn send(&self, message: T) -> Result<(), SeccErrors<T>> {
-        unsafe {
-            // Retrieve send pointers and the encoded indexes inside them and their Condvar.
-            let (ref mutex, ref condvar) = &*self.core.send_ptrs;
-            let mut send_ptrs = mutex.lock().unwrap();
+        // Retrieve send pointers and the encoded indexes inside them and their Condvar.
+        let (ref mutex, ref condvar) = &*self.core.send_ptrs;
+        let mut send_ptrs = mutex.lock().unwrap();
 
-            // Get a pointer to the current pool_head and see if we have space to send.
-            let pool_head_ptr = &self.core.nodes[send_ptrs.pool_head];
-            let next_pool_head = pool_head_ptr.next.load(Ordering::SeqCst);
-            if NIL == next_pool_head {
-                Err(SeccErrors::Full(message))
-            } else {
-                // We get the queue tail because the node from the pool will move here.
-                let queue_tail_ptr = &self.core.nodes[send_ptrs.queue_tail];
+        // Get a pointer to the current pool_head and see if we have space to send.
+        let pool_head_ptr = &self.core.nodes[send_ptrs.pool_head];
+        let next_pool_head = pool_head_ptr.next.load(Ordering::SeqCst);
+        if NIL == next_pool_head {
+            Err(SeccErrors::Full(message))
+        } else {
+            // We get the queue tail because the node from the pool will move here.
+            let queue_tail_ptr = &self.core.nodes[send_ptrs.queue_tail];
 
-                // Add the message to the node, transferring ownership.
+            // Add the message to the node, transferring ownership.
+            unsafe {
                 *queue_tail_ptr.cell.get() = Some(message);
-
-                // Update the pointers in the mutex.
-                let old_pool_head = send_ptrs.pool_head;
-                send_ptrs.queue_tail = send_ptrs.pool_head;
-                send_ptrs.pool_head = next_pool_head;
-
-                // Adjust the channel metrics.
-                self.core.sent.fetch_add(1, Ordering::SeqCst);
-                self.core.receivable.fetch_add(1, Ordering::SeqCst);
-                self.core.pending.fetch_add(1, Ordering::SeqCst);
-
-                // The now filled node will get moved to the queue.
-                pool_head_ptr.next.store(NIL, Ordering::SeqCst);
-
-                // We MUST set this LAST or we will get into a race with the receiver that would
-                // think this node is ready for receiving when it isn't until just now.
-                queue_tail_ptr.next.store(old_pool_head, Ordering::SeqCst);
-
-                // Notify anyone that was waiting on the Condvar and we are done.
-                condvar.notify_all();
-                Ok(())
             }
+
+            // Update the pointers in the mutex.
+            let old_pool_head = send_ptrs.pool_head;
+            send_ptrs.queue_tail = send_ptrs.pool_head;
+            send_ptrs.pool_head = next_pool_head;
+
+            // Adjust the channel metrics.
+            self.core.sent.fetch_add(1, Ordering::SeqCst);
+            self.core.receivable.fetch_add(1, Ordering::SeqCst);
+            self.core.pending.fetch_add(1, Ordering::SeqCst);
+
+            // The now filled node will get moved to the queue.
+            pool_head_ptr.next.store(NIL, Ordering::SeqCst);
+
+            // We MUST set this LAST or we will get into a race with the receiver that would
+            // think this node is ready for receiving when it isn't until just now.
+            queue_tail_ptr.next.store(old_pool_head, Ordering::SeqCst);
+
+            // Notify anyone that was waiting on the Condvar and we are done.
+            condvar.notify_all();
+            Ok(())
         }
     }
 
@@ -348,29 +348,29 @@ impl<T: Sync + Send> Clone for SeccReceiver<T> {
 impl<T: Sync + Send> SeccReceiver<T> {
     /// Peeks at the next receivable message in the channel.
     pub fn peek(&self) -> Result<&T, SeccErrors<T>> {
-        unsafe {
-            // Retrieve receive pointers and the encoded indexes inside them.
-            let (ref mutex, _) = &*self.core.receive_ptrs;
-            let receive_ptrs = mutex.lock().unwrap();
+        // Retrieve receive pointers and the encoded indexes inside them.
+        let (ref mutex, _) = &*self.core.receive_ptrs;
+        let receive_ptrs = mutex.lock().unwrap();
 
-            // Get a pointer to the queue_head or cursor and see check for anything receivable.
-            let read_ptr = if receive_ptrs.cursor == NIL {
-                &self.core.nodes[receive_ptrs.queue_head]
-            } else {
-                &self.core.nodes[receive_ptrs.cursor]
-            };
-            let next_read_pos = (*read_ptr).next.load(Ordering::SeqCst);
-            if NIL == next_read_pos {
-                return Err(SeccErrors::Empty);
-            }
-
-            // Extract the message and return a reference to it. If this panics then there
-            // was somehow a receivable node with no message in it which should never happen.
-            let message: &T = (*((*read_ptr).cell).get())
-                .as_ref()
-                .expect("secc::peek(): empty receivable node");
-            Ok(message)
+        // Get a pointer to the queue_head or cursor and see check for anything receivable.
+        let read_ptr = if receive_ptrs.cursor == NIL {
+            &self.core.nodes[receive_ptrs.queue_head]
+        } else {
+            &self.core.nodes[receive_ptrs.cursor]
+        };
+        let next_read_pos = (*read_ptr).next.load(Ordering::SeqCst);
+        if NIL == next_read_pos {
+            return Err(SeccErrors::Empty);
         }
+
+        // Extract the message and return a reference to it. If this panics then there
+        // was somehow a receivable node with no message in it which should never happen.
+        let message: &T = unsafe {
+            (*((*read_ptr).cell).get())
+                .as_ref()
+                .expect("secc::peek(): empty receivable node")
+        };
+        Ok(message)
     }
 
     /// Receives the next message that is receivable. This will either receive the message at
@@ -380,68 +380,66 @@ impl<T: Sync + Send> SeccReceiver<T> {
     /// are actually messages in the channel because there will be none readable until the skip
     /// is reset.
     pub fn receive(&self) -> Result<T, SeccErrors<T>> {
-        unsafe {
-            // Retrieve receive pointers and the encoded indexes inside them.
-            let (ref mutex, ref condvar) = &*self.core.receive_ptrs;
-            let mut receive_ptrs = mutex.lock().unwrap();
+        // Retrieve receive pointers and the encoded indexes inside them.
+        let (ref mutex, ref condvar) = &*self.core.receive_ptrs;
+        let mut receive_ptrs = mutex.lock().unwrap();
 
-            // Get a pointer to the queue_head or cursor and see check for anything receivable.
-            let read_ptr = if receive_ptrs.cursor == NIL {
-                &self.core.nodes[receive_ptrs.queue_head]
-            } else {
-                &self.core.nodes[receive_ptrs.cursor]
-            };
-            let next_read_pos = (*read_ptr).next.load(Ordering::SeqCst);
-            if NIL == next_read_pos {
-                Err(SeccErrors::Empty)
-            } else {
-                // We can read something so we will pull the item out of the read pointer.
-                let message: T = (*(*read_ptr).cell.get()).take().unwrap();
+        // Get a pointer to the queue_head or cursor and see check for anything receivable.
+        let read_ptr = if receive_ptrs.cursor == NIL {
+            &self.core.nodes[receive_ptrs.queue_head]
+        } else {
+            &self.core.nodes[receive_ptrs.cursor]
+        };
+        let next_read_pos = (*read_ptr).next.load(Ordering::SeqCst);
+        if NIL == next_read_pos {
+            Err(SeccErrors::Empty)
+        } else {
+            // We can read something so we will pull the item out of the read pointer.
+            let message: T = unsafe { (*(*read_ptr).cell.get()).take().unwrap() };
 
-                // Now we have to manage either pulling a node out of the middle if there was a
-                // cursor, or from the queue head if there was no cursor. Then we have to place
-                // the released node on the pool tail.
-                let pool_tail_ptr = &self.core.nodes[receive_ptrs.pool_tail];
+            // Now we have to manage either pulling a node out of the middle if there was a
+            // cursor, or from the queue head if there was no cursor. Then we have to place
+            // the released node on the pool tail.
+            let pool_tail_ptr = &self.core.nodes[receive_ptrs.pool_tail];
+            (*read_ptr).next.store(NIL, Ordering::SeqCst);
+
+            let new_pool_tail = if receive_ptrs.cursor == NIL {
+                // If we aren't using a cursor then the queue_head becomes the pool tail
+                receive_ptrs.pool_tail = receive_ptrs.queue_head;
+                let old_queue_head = receive_ptrs.queue_head;
+                receive_ptrs.queue_head = next_read_pos;
+                old_queue_head
+            } else {
+                // If the cursor is set we have to dequeue in the middle of the list and fix
+                // the node chain and then move the node that the cursor was pointing at to
+                // the pool tail. Note that the `skipped` pointer will never be [`NIL`]
+                // when the cursor is not [`NIL`]. The `skipped` pointer is only ever
+                // set to a skipped node that could be read and lags beind `cursor` by one
+                // node in the queue.
+                let skipped_ptr = &self.core.nodes[receive_ptrs.skipped];
+                ((*skipped_ptr).next).store(next_read_pos, Ordering::SeqCst);
                 (*read_ptr).next.store(NIL, Ordering::SeqCst);
+                receive_ptrs.pool_tail = receive_ptrs.cursor;
+                let old_cursor = receive_ptrs.cursor;
+                receive_ptrs.cursor = next_read_pos;
+                old_cursor
+            };
 
-                let new_pool_tail = if receive_ptrs.cursor == NIL {
-                    // If we aren't using a cursor then the queue_head becomes the pool tail
-                    receive_ptrs.pool_tail = receive_ptrs.queue_head;
-                    let old_queue_head = receive_ptrs.queue_head;
-                    receive_ptrs.queue_head = next_read_pos;
-                    old_queue_head
-                } else {
-                    // If the cursor is set we have to dequeue in the middle of the list and fix
-                    // the node chain and then move the node that the cursor was pointing at to
-                    // the pool tail. Note that the `skipped` pointer will never be [`NIL`]
-                    // when the cursor is not [`NIL`]. The `skipped` pointer is only ever
-                    // set to a skipped node that could be read and lags beind `cursor` by one
-                    // node in the queue.
-                    let skipped_ptr = &self.core.nodes[receive_ptrs.skipped];
-                    ((*skipped_ptr).next).store(next_read_pos, Ordering::SeqCst);
-                    (*read_ptr).next.store(NIL, Ordering::SeqCst);
-                    receive_ptrs.pool_tail = receive_ptrs.cursor;
-                    let old_cursor = receive_ptrs.cursor;
-                    receive_ptrs.cursor = next_read_pos;
-                    old_cursor
-                };
+            // Update the channel metrics.
+            self.core.received.fetch_add(1, Ordering::SeqCst);
+            self.core.receivable.fetch_sub(1, Ordering::SeqCst);
+            self.core.pending.fetch_sub(1, Ordering::SeqCst);
 
-                // Update the channel metrics.
-                self.core.received.fetch_add(1, Ordering::SeqCst);
-                self.core.receivable.fetch_sub(1, Ordering::SeqCst);
-                self.core.pending.fetch_sub(1, Ordering::SeqCst);
+            // Finally add the new pool tail to the previous pool tail. We MUST set this
+            // LAST or we get into a race with the sender which would think that the node
+            // is available for sending when it actually isn't until just now.
+            (*pool_tail_ptr).next.store(new_pool_tail, Ordering::SeqCst);
 
-                // Finally add the new pool tail to the previous pool tail. We MUST set this
-                // LAST or we get into a race with the sender which would think that the node
-                // is available for sending when it actually isn't until just now.
-                (*pool_tail_ptr).next.store(new_pool_tail, Ordering::SeqCst);
+            // Notify anyone waiting on messages to be available.
+            condvar.notify_all();
 
-                // Notify anyone waiting on messages to be available.
-                condvar.notify_all();
-
-                // Return the message retreived earlier.
-                Ok(message)
-            }
+            // Return the message retreived earlier.
+            Ok(message)
         }
     }
 
