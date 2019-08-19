@@ -76,8 +76,3 @@ physically.
 
 [Release Notes for All Versions](https://github.com/rsimmonsjr/secc/blob/master/RELEASE_NOTES.md)
 
-## Acknowledgements
-
-This product would not be possible without all the help and support I have received on the Rust
-discord server, especially from the user Talchas.
-
