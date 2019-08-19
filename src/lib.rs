@@ -2,6 +2,11 @@
 //! senders and multiple recievers and allows the receiver to temporarily skip receiving messages
 //! if they desire.
 //!
+//! Messages in the channel need to be clonable to implement the [`peek`] functionality (which
+//! returns a clone of the message). For this reason it is advisable that the user chose a type
+//! that is efficiently clonable, such as an [`Arc`], if they want to send a message that cannot
+//! be efficiently cloned.
+//!
 //! The channel is a FIFO structure unless the user intends to skip one or more messages
 //! in which case a message could be read in a different order. The channel does, however,
 //! guarantee that the messages will remain in the same order as sent and, unless skipped, will
@@ -48,7 +53,7 @@ const NIL: usize = 1 << 16 as usize;
 
 /// Errors potentially returned from channel operations.
 #[derive(Eq, PartialEq)]
-pub enum SeccErrors<T: Sync + Send> {
+pub enum SeccErrors<T: Sync + Send + Clone> {
     /// Channel is full, no more messages can be sent, the enclosed message contains the last
     /// message attempted to be sent.
     Full(T),
@@ -59,7 +64,7 @@ pub enum SeccErrors<T: Sync + Send> {
     Empty,
 }
 
-impl<T: Sync + Send> fmt::Debug for SeccErrors<T> {
+impl<T: Sync + Send + Clone> fmt::Debug for SeccErrors<T> {
     fn fmt(&self, formatter: &'_ mut fmt::Formatter) -> fmt::Result {
         match self {
             SeccErrors::Full(_) => write!(formatter, "SeccErrors::Full"),
@@ -69,7 +74,7 @@ impl<T: Sync + Send> fmt::Debug for SeccErrors<T> {
 }
 
 /// A single node in the channel's buffer.
-struct SeccNode<T: Sync + Send> {
+struct SeccNode<T: Sync + Send + Clone> {
     /// Contains a message in a `Some` or contains `None` if the node is empty. Note that this is
     /// an [`UnsafeCell`] in order to get around Rust mutability locks so that this data structure
     /// can be passed around immutably but also still be able to send and receive.
@@ -79,7 +84,7 @@ struct SeccNode<T: Sync + Send> {
     // FIXME (Issue #12) Add tracking of time in channel by milliseconds.
 }
 
-impl<T: Sync + Send> SeccNode<T> {
+impl<T: Sync + Send + Clone> SeccNode<T> {
     /// Creates a new node where the next index is set to the `NIL`.
     fn new() -> SeccNode<T> {
         SeccNode {
@@ -98,7 +103,7 @@ impl<T: Sync + Send> SeccNode<T> {
     }
 }
 
-pub trait SeccCoreOps<T: Sync + Send> {
+pub trait SeccCoreOps<T: Sync + Send + Clone> {
     /// Fetch the core of the channel.
     fn core(&self) -> &SeccCore<T>;
 
@@ -170,7 +175,7 @@ struct SeccReceivePtrs {
 
 /// Data structure that contains the core of the channel including tracking of statistics and
 /// node storage.
-pub struct SeccCore<T: Sync + Send> {
+pub struct SeccCore<T: Sync + Send + Clone> {
     /// Capacity of the channel, which is the total number of items that can be stored. Note that
     /// there will be 2 additional nodes allocated because neither the queue nor pool may ever
     /// be empty.
@@ -207,14 +212,14 @@ pub struct SeccCore<T: Sync + Send> {
 }
 
 /// Sender side of the channel.
-pub struct SeccSender<T: Sync + Send> {
+pub struct SeccSender<T: Sync + Send + Clone> {
     /// The core of the channel.
     core: Arc<SeccCore<T>>,
 }
 
 // Manual implementation necessary because of the following issue.
 // https://github.com/rust-lang/rust/issues/26925
-impl<T: Sync + Send> Clone for SeccSender<T> {
+impl<T: Sync + Send + Clone> Clone for SeccSender<T> {
     fn clone(&self) -> Self {
         SeccSender {
             core: self.core.clone(),
@@ -222,7 +227,7 @@ impl<T: Sync + Send> Clone for SeccSender<T> {
     }
 }
 
-impl<T: Sync + Send> SeccSender<T> {
+impl<T: Sync + Send + Clone> SeccSender<T> {
     /// Sends a message, which will be moved into the channel. This function will either return
     /// an empty [`std::Result::Ok`] or an [`std::Result::Err`] containing the last message
     /// sent if something went wrong.
@@ -319,25 +324,25 @@ impl<T: Sync + Send> SeccSender<T> {
     }
 }
 
-impl<T: Sync + Send> SeccCoreOps<T> for SeccSender<T> {
+impl<T: Sync + Send + Clone> SeccCoreOps<T> for SeccSender<T> {
     fn core(&self) -> &SeccCore<T> {
         &self.core
     }
 }
 
-unsafe impl<T: Send + Sync> Send for SeccSender<T> {}
+unsafe impl<T: Send + Sync + Clone> Send for SeccSender<T> {}
 
-unsafe impl<T: Send + Sync> Sync for SeccSender<T> {}
+unsafe impl<T: Send + Sync + Clone> Sync for SeccSender<T> {}
 
 /// Receiver side of the channel.
-pub struct SeccReceiver<T: Sync + Send> {
+pub struct SeccReceiver<T: Sync + Send + Clone> {
     /// The core of the channel.
     core: Arc<SeccCore<T>>,
 }
 
 // Manual implementation necessary because of the following issue.
 // https://github.com/rust-lang/rust/issues/26925
-impl<T: Sync + Send> Clone for SeccReceiver<T> {
+impl<T: Sync + Send + Clone> Clone for SeccReceiver<T> {
     fn clone(&self) -> Self {
         SeccReceiver {
             core: self.core.clone(),
@@ -345,9 +350,12 @@ impl<T: Sync + Send> Clone for SeccReceiver<T> {
     }
 }
 
-impl<T: Sync + Send> SeccReceiver<T> {
-    /// Peeks at the next receivable message in the channel.
-    pub fn peek(&self) -> Result<&T, SeccErrors<T>> {
+impl<T: Sync + Send + Clone> SeccReceiver<T> {
+    /// Peeks at the next receivable message in the channel and returns a Clone of the message.
+    /// Note that the message isn't guaranteed to stay in the channel as a thread could pop the
+    /// message off while another user is looking at the value but the value shouldn't change
+    /// under the user.
+    pub fn peek(&self) -> Result<T, SeccErrors<T>> {
         // Retrieve receive pointers and the encoded indexes inside them.
         let (ref mutex, _) = &*self.core.receive_ptrs;
         let receive_ptrs = mutex.lock().unwrap();
@@ -365,9 +373,9 @@ impl<T: Sync + Send> SeccReceiver<T> {
 
         // Extract the message and return a reference to it. If this panics then there
         // was somehow a receivable node with no message in it which should never happen.
-        let message: &T = unsafe {
+        let message: T = unsafe {
             (*((*read_ptr).cell).get())
-                .as_ref()
+                .clone()
                 .expect("secc::peek(): empty receivable node")
         };
         Ok(message)
@@ -574,20 +582,23 @@ impl<T: Sync + Send> SeccReceiver<T> {
     }
 }
 
-impl<T: Sync + Send> SeccCoreOps<T> for SeccReceiver<T> {
+impl<T: Sync + Send + Clone> SeccCoreOps<T> for SeccReceiver<T> {
     fn core(&self) -> &SeccCore<T> {
         &self.core
     }
 }
 
-unsafe impl<T: Send + Sync> Send for SeccReceiver<T> {}
+unsafe impl<T: Send + Sync + Clone> Send for SeccReceiver<T> {}
 
-unsafe impl<T: Send + Sync> Sync for SeccReceiver<T> {}
+unsafe impl<T: Send + Sync + Clone> Sync for SeccReceiver<T> {}
 
 /// Creates the sender and receiver sides of this channel and returns them as a tuple. The user
 /// can pass both a channel `capacity` and a `poll_ms` which govern how long operations that
 /// wait on the channel will poll.
-pub fn create<T: Sync + Send>(capacity: u16, poll_ms: u16) -> (SeccSender<T>, SeccReceiver<T>) {
+pub fn create<T: Sync + Send + Clone>(
+    capacity: u16,
+    poll_ms: u16,
+) -> (SeccSender<T>, SeccReceiver<T>) {
     if capacity < 1 {
         panic!("capacity cannot be smaller than 1");
     }
@@ -733,7 +744,7 @@ mod tests {
     }
 
     /// Creates a debug string for diagnosing problems with the send side of the channel.
-    fn debug_send<T: Send + Sync>(
+    fn debug_send<T: Send + Sync + Clone>(
         core: Arc<SeccCore<T>>,
         send_ptrs: MutexGuard<SeccSendPtrs>,
     ) -> String {
@@ -754,7 +765,7 @@ mod tests {
     }
 
     /// Creates a debug string for diagnosing problems with the receive side of the channel.
-    fn debug_receive<T: Send + Sync>(
+    fn debug_receive<T: Send + Sync + Clone>(
         core: Arc<SeccCore<T>>,
         receive_ptrs: MutexGuard<SeccReceivePtrs>,
     ) -> String {
@@ -777,7 +788,7 @@ mod tests {
     }
 
     /// Creates a debug string for debugging channel problems.
-    pub fn debug_channel<T: Send + Sync>(core: Arc<SeccCore<T>>) -> String {
+    pub fn debug_channel<T: Send + Sync + Clone>(core: Arc<SeccCore<T>>) -> String {
         let r = core.receivable.load(Ordering::Relaxed);
         let (ref mutex, _) = &*core.receive_ptrs;
         let receive_ptrs = mutex.lock().unwrap();
@@ -791,7 +802,7 @@ mod tests {
         )
     }
 
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(Debug, Eq, PartialEq, Clone)]
     enum Items {
         A,
         B,
@@ -799,6 +810,20 @@ mod tests {
         D,
         E,
         F,
+    }
+
+    #[test]
+    fn test_pop_after_peek() {
+        use std::num::NonZeroU8;
+
+        let value = NonZeroU8::new(5).unwrap();
+        let (tx, rx) = create::<NonZeroU8>(1, 100);
+        tx.send(value).unwrap();
+        let item = rx.peek().unwrap();
+        assert_eq!(value, item);
+        // Popping shouldnt change the value.
+        rx.pop().unwrap();
+        assert_eq!(value, item);
     }
 
     #[test]
@@ -868,7 +893,7 @@ mod tests {
         // test wouldn't compile.
         struct Unclonable {}
 
-        let (sender, receiver) = create::<Unclonable>(5, 10);
+        let (sender, receiver) = create::<Arc<Unclonable>>(5, 10);
         let _s_clone = sender.clone();
         let _r_clone = receiver.clone();
     }
@@ -1000,7 +1025,7 @@ mod tests {
         assert_pointer_nodes!(sender, receiver, 0, 2, 1, 1, NIL, NIL);
 
         // Peek at the first message in the channel which should change nothing.
-        assert_eq!(Ok(&Items::A), receiver.peek());
+        assert_eq!(Ok(Items::A), receiver.peek());
         assert_eq!(5, receiver.pending());
         assert_eq!(5, receiver.receivable());
         assert_eq!(5, receiver.sent());
@@ -1220,7 +1245,7 @@ mod tests {
         assert_pointer_nodes!(sender, receiver, 1, 6, 5, 2, 1, 0);
 
         // Peek will return a reference to cursor's item but not delete it.
-        assert_eq!(Ok(&Items::B), receiver.peek());
+        assert_eq!(Ok(Items::B), receiver.peek());
         assert_eq!(2, receiver.pending());
         assert_eq!(1, receiver.receivable());
         assert_eq!(8, receiver.sent());
@@ -1237,7 +1262,7 @@ mod tests {
         // Sending another item while skipping and after peeking should work but peek shouldn't
         // move to the new node.
         assert_eq!(Ok(()), sender.send(Items::C));
-        assert_eq!(Ok(&Items::B), receiver.peek());
+        assert_eq!(Ok(Items::B), receiver.peek());
         assert_eq!(3, receiver.pending());
         assert_eq!(2, receiver.receivable());
         assert_eq!(9, receiver.sent());
