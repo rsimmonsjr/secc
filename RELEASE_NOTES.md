@@ -1,5 +1,7 @@
 # Release Notes
 
+* 2019-08-18: 0.0.9
+  * Most `unsafe` code has been eliminated, enhancing stability.
 * 2019-08-17: 0.0.8
   * Fixing issue #4
 * 2019-08-17: 0.0.7
