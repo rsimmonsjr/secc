@@ -802,6 +802,16 @@ mod tests {
     }
 
     #[test]
+    fn test_peek_empty() {
+        let (sender, receiver) = create::<Items>(5, 10);
+        assert_eq!(Err(SeccErrors::Empty), receiver.peek());
+
+        sender.send(Items::A).unwrap();
+        receiver.pop().unwrap();
+        assert_eq!(Err(SeccErrors::Empty), receiver.peek());
+    }
+
+    #[test]
     fn test_pop_while_peeking() {
         // Tests that the user should not be able to pop while another thread is peeking at
         // the data.
