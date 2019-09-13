@@ -28,7 +28,7 @@
 //! ```rust
 //! use secc::*;
 //!
-//! let channel = create::<u8>(5, 10);
+//! let channel = create::<u8>(5, Duration::from_millis(10));
 //! let (sender, receiver) = channel;
 //! assert_eq!(Ok(()), sender.send(17));
 //! assert_eq!(Ok(()), sender.send(19));
@@ -40,6 +40,31 @@
 //! assert_eq!(Ok(()), receiver.reset_skip());
 //! assert_eq!(Ok(19), receiver.receive());
 //! ```
+//! This code creates the channel and then sends it a series of messages. The first is received
+//! normally but then the user wants to skip the next message. The user can then receive in
+//! the middle of the channel, reset the skip and resume receiving normally.
+//!
+//!
+//! ### Design Principals
+//!
+//! SECC was driven by the need for a multi-sender, multi-consumer channel that would have the
+//! ability to skip processing messages. There are many situation in which this is needed by a
+//! consumer such as the use case with Axiom where actors implement a finite state machine. That
+//! led me to go through many iterations of different designs until it became clear that a linked
+//! list was the only legitimate approach. The problem with a linked lists is that they typically
+//! burn a lot of CPU time in allocating new nodes on each enqueue. The solution was to use two
+//! linked lists, allocate all nodes up front and just logically move nodes around. The actual
+//! pointers to the next node or the various heads and tails are the indexes in the statically
+//! allocated slice of nodes. When send and receive operations happen, nodes are merely moved
+//! around logically but not physically.
+//!
+//! ### What's New
+//! * 2019-09-13: 0.0.10
+//!   * Issue #13: A Deadlock would occur if the timeout occurred while waiting for space or data.
+//! * 2019-08-18: 0.0.9
+//!   * Most `unsafe` code has been eliminated, enhancing stability.
+//!
+//! [Release Notes for All Versions](https://github.com/rsimmonsjr/secc/blob/master/RELEASE_NOTES.md)
 
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -181,7 +206,7 @@ pub struct SeccCore<T: Sync + Send + Clone> {
     /// be empty.
     capacity: usize,
     /// The timeout used for polling the channel when waiting forever to send or recieve.
-    poll_ms: u16,
+    poll_timeout: Duration,
     /// Storage of the nodes. Note this field is preceded with an underscore because although
     /// the nodes live here they are never used directly once allocated.
     nodes: Box<[SeccNode<T>]>,
@@ -277,12 +302,15 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
     /// function is semantically identical to [`SeccSender::send`] but simply waits
     /// for there to be space in the channel before sending. If the timeout is not provided this
     /// function will wait forever for capacity.
-    pub fn send_await_timeout(&self, mut message: T, timeout_ms: u16) -> Result<(), SeccErrors<T>> {
+    pub fn send_await_timeout(
+        &self,
+        mut message: T,
+        timeout: Duration,
+    ) -> Result<(), SeccErrors<T>> {
         loop {
             match self.send(message) {
                 Err(SeccErrors::Full(v)) => {
                     message = v;
-                    let dur = Duration::from_millis(timeout_ms as u64);
                     // We will put a condvar on the mutex to be notified if space opens up.
                     let (ref mutex, ref condvar) = &*self.core.receive_ptrs;
                     let receive_ptrs = mutex.lock().unwrap();
@@ -298,9 +326,10 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
                     let next_read_pos = self.core.nodes[read_index].next.load(Ordering::SeqCst);
                     if NIL != next_read_pos {
                         // Drops the guard as we don't need the lock here.
-                        let timed_out = condvar.wait_timeout(receive_ptrs, dur).unwrap().1;
+                        let (guard, result) = condvar.wait_timeout(receive_ptrs, timeout).unwrap();
                         self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
-                        if timed_out.timed_out() {
+                        if result.timed_out() {
+                            // println!("{:?} ===> send timed out", Instant::now());
                             // We will try one more time to send in case we missed a notify.
                             return self.send(message);
                         }
@@ -315,7 +344,7 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
     // milliseconds passed when creating the channel.
     pub fn send_await(&self, mut message: T) -> Result<(), SeccErrors<T>> {
         loop {
-            match self.send_await_timeout(message, self.core.poll_ms) {
+            match self.send_await_timeout(message, self.core.poll_timeout) {
                 Err(SeccErrors::Full(v)) => {
                     message = v;
                 }
@@ -461,11 +490,10 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
 
     /// A helper to call [`SeccReceiver::receive`] and await receivable messages
     /// until a specified optional timeout has expired.
-    pub fn receive_await_timeout(&self, timeout_ms: u16) -> Result<T, SeccErrors<T>> {
+    pub fn receive_await_timeout(&self, timeout: Duration) -> Result<T, SeccErrors<T>> {
         loop {
             match self.receive() {
                 Err(SeccErrors::Empty) => {
-                    let dur = Duration::from_millis(timeout_ms as u64);
                     let (ref mutex, ref condvar) = &*self.core.send_ptrs;
                     let send_ptrs = mutex.lock().unwrap();
 
@@ -478,9 +506,10 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
                     if NIL != next_pool_head {
                         // In this case there is still nothing to read so we set up a Condvar
                         // and wait for the sender to notify us of new available messages.
-                        let timed_out = condvar.wait_timeout(send_ptrs, dur).unwrap().1;
+                        let (guard, result) = condvar.wait_timeout(send_ptrs, timeout).unwrap();
                         self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
-                        if timed_out.timed_out() {
+                        if result.timed_out() {
+                            // println!("{:?} ===> receive timed out", std::time::Instant::now());
                             // Try one more time at the end of the timeout in case we missed
                             // a notification.
                             return self.receive();
@@ -497,7 +526,7 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
     // keep polling until it has a result.
     pub fn receive_await(&self) -> Result<T, SeccErrors<T>> {
         loop {
-            match self.receive_await_timeout(10) {
+            match self.receive_await_timeout(self.core.poll_timeout) {
                 Err(SeccErrors::Empty) => (),
                 other => return other,
             }
@@ -598,7 +627,7 @@ unsafe impl<T: Send + Sync + Clone> Sync for SeccReceiver<T> {}
 /// wait on the channel will poll.
 pub fn create<T: Sync + Send + Clone>(
     capacity: u16,
-    poll_ms: u16,
+    poll_timeout: Duration,
 ) -> (SeccSender<T>, SeccReceiver<T>) {
     if capacity < 1 {
         panic!("capacity cannot be smaller than 1");
@@ -642,7 +671,7 @@ pub fn create<T: Sync + Send + Clone>(
     // Create the channel structures.
     let core = Arc::new(SeccCore {
         capacity: capacity as usize,
-        poll_ms,
+        poll_timeout,
         nodes: nodes.into_boxed_slice(),
         send_ptrs: Arc::new((Mutex::new(send_ptrs), Condvar::new())),
         receive_ptrs: Arc::new((Mutex::new(receive_ptrs), Condvar::new())),
@@ -670,6 +699,7 @@ mod tests {
     use log::LevelFilter;
     use std::sync::MutexGuard;
     use std::thread;
+    use std::thread::JoinHandle;
     use std::time::Duration;
 
     pub fn init_test_log() {
@@ -818,7 +848,7 @@ mod tests {
         use std::num::NonZeroU8;
 
         let value = NonZeroU8::new(5).unwrap();
-        let (tx, rx) = create::<NonZeroU8>(1, 100);
+        let (tx, rx) = create::<NonZeroU8>(1, Duration::from_millis(100));
         tx.send(value).unwrap();
         let item = rx.peek().unwrap();
         assert_eq!(value, item);
@@ -829,7 +859,7 @@ mod tests {
 
     #[test]
     fn test_peek_empty() {
-        let (sender, receiver) = create::<Items>(5, 10);
+        let (sender, receiver) = create::<Items>(5, Duration::from_millis(10));
         assert_eq!(Err(SeccErrors::Empty), receiver.peek());
 
         sender.send(Items::A).unwrap();
@@ -841,7 +871,7 @@ mod tests {
     fn test_pop_while_peeking() {
         // Tests that the user should not be able to pop while another thread is peeking at
         // the data.
-        let (sender, receiver) = create::<Items>(5, 10);
+        let (sender, receiver) = create::<Items>(5, Duration::from_millis(10));
         let peeked = Arc::new((Mutex::new(false), Condvar::new()));
         let popped = Arc::new((Mutex::new(false), Condvar::new()));
 
@@ -894,7 +924,7 @@ mod tests {
         // test wouldn't compile.
         struct Unclonable {}
 
-        let (sender, receiver) = create::<Arc<Unclonable>>(5, 10);
+        let (sender, receiver) = create::<Arc<Unclonable>>(5, Duration::from_millis(10));
         let _s_clone = sender.clone();
         let _r_clone = receiver.clone();
     }
@@ -905,7 +935,7 @@ mod tests {
 
         // This test checks the basic functionality of sending and receiving messages from the
         // channel in a single thread. This is used to verify basic functionality.
-        let channel = create::<Items>(5, 10);
+        let channel = create::<Items>(5, Duration::from_millis(10));
         let (sender, receiver) = channel;
 
         // fetch the pointers for easy checking of the nodes.
@@ -1339,12 +1369,12 @@ mod tests {
         // receivers on different threads.
         let message_count = 200;
         let capacity = 32;
-        let (sender, receiver) = create::<u32>(capacity, 20);
+        let (sender, receiver) = create::<u32>(capacity, Duration::from_millis(20));
 
         let rx = thread::spawn(move || {
             let mut count = 0;
             while count < message_count {
-                match receiver.receive_await_timeout(20) {
+                match receiver.receive_await_timeout(Duration::from_millis(20)) {
                     Ok(_v) => count += 1,
                     _ => (),
                 };
@@ -1353,7 +1383,9 @@ mod tests {
 
         let tx = thread::spawn(move || {
             for i in 0..message_count {
-                sender.send_await_timeout(i, 20).unwrap();
+                sender
+                    .send_await_timeout(i, Duration::from_millis(20))
+                    .unwrap();
                 thread::sleep(Duration::from_millis(1));
             }
         });
@@ -1362,13 +1394,13 @@ mod tests {
         rx.join().unwrap();
     }
 
+    /// Test that if a user attempts to receive before a message is sent, he will be forced
+    /// to wait for the message.
     #[test]
     fn test_receive_before_send() {
         init_test_log();
 
-        // Test that if a user attempts to receive before a message is sent, he will be forced
-        // to wait for the message.
-        let (sender, receiver) = create::<u32>(5, 20);
+        let (sender, receiver) = create::<u32>(5, Duration::from_millis(20));
         let receiver2 = receiver.clone();
         let mutex = Arc::new(Mutex::new(false));
         let rx_mutex = mutex.clone();
@@ -1377,7 +1409,7 @@ mod tests {
             let mut guard = rx_mutex.lock().unwrap();
             *guard = true;
             drop(guard);
-            match receiver2.receive_await_timeout(20) {
+            match receiver2.receive_await_timeout(Duration::from_millis(20)) {
                 Ok(_) => assert!(true),
                 e => assert!(false, "Error {:?} when receive.", e),
             };
@@ -1392,7 +1424,7 @@ mod tests {
         }
 
         let tx = thread::spawn(move || {
-            match sender.send_await_timeout(1, 20) {
+            match sender.send_await_timeout(1, Duration::from_millis(20)) {
                 Ok(_) => assert!(true),
                 e => assert!(false, "Error {:?} when receive.", e),
             };
@@ -1407,13 +1439,86 @@ mod tests {
         assert_eq!(0, receiver.receivable());
     }
 
+    fn counted_sender<T: Sync + Send + Clone + 'static>(
+        sender: SeccSender<T>,
+        pair: Arc<(Mutex<bool>, Condvar)>,
+        message: T,
+        count: usize,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let (ref mutex, ref condvar) = &*pair;
+            let mut started = mutex.lock().unwrap();
+            while !*started {
+                started = condvar.wait(started).unwrap();
+            }
+
+            while sender.sent() < count {
+                println!("<<< sent: {}", sender.sent());
+                let _result = sender.send_await(message.clone());
+            }
+            println!("---> sender done");
+        })
+    }
+
+    fn counted_receiver(
+        receiver: SeccReceiver<u32>,
+        pair: Arc<(Mutex<bool>, Condvar)>,
+        count: usize,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let (ref mutex, ref condvar) = &*pair;
+            let mut started = mutex.lock().unwrap();
+            while !*started {
+                started = condvar.wait(started).unwrap();
+            }
+
+            while receiver.received() < count {
+                println!("<<< received: {}", receiver.received());
+                let _result = receiver.receive_await();
+            }
+            println!("---> sender done");
+        })
+    }
+
+    /// Test conditions to make sure the channel doesn't lock up under stress as shown by
+    /// issue 13.
+    #[test]
+    fn test_multiple_receiver_single_producer() {
+        init_test_log();
+        const COUNT: usize = 10000;
+
+        let (sender, receiver) = create::<u32>(10, Duration::from_millis(1));
+
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let rx_thread1 = counted_receiver(receiver.clone(), pair.clone(), COUNT);
+        let rx_thread2 = counted_receiver(receiver.clone(), pair.clone(), COUNT);
+        let tx_thread = counted_sender(sender.clone(), pair.clone(), 7 as u32, COUNT);
+
+        thread::sleep(Duration::from_millis(1)); // gives threads time to start.
+        let (ref mutex, ref condvar) = &*pair;
+        let mut started = mutex.lock().unwrap();
+        *started = true;
+        condvar.notify_all();
+        drop(started);
+
+        tx_thread.join().unwrap();
+        rx_thread1.join().unwrap();
+        rx_thread2.join().unwrap();
+        println!(
+            "---> test sent {}, and received {} messages.",
+            sender.sent(),
+            sender.received()
+        );
+    }
+
     #[test]
     fn test_receive_concurrent_send() {
         init_test_log();
 
         // Tests that triggering send and receive as close to at the same time as possible does
         // not cause any race conditions.
-        let (sender, receiver) = create::<u32>(5, 20);
+        let (sender, receiver) = create::<u32>(5, Duration::from_millis(20));
         let receiver2 = receiver.clone();
         let pair = Arc::new((Mutex::new((false, false)), Condvar::new()));
         let rx_pair = pair.clone();
@@ -1424,7 +1529,7 @@ mod tests {
             guard.0 = true;
             let c_guard = rx_pair.1.wait(guard).unwrap();
             drop(c_guard);
-            match receiver2.receive_await_timeout(20) {
+            match receiver2.receive_await_timeout(Duration::from_millis(20)) {
                 Ok(_) => assert!(true),
                 e => assert!(false, "Error {:?} when receive.", e),
             };
@@ -1434,7 +1539,7 @@ mod tests {
             guard.1 = true;
             let c_guard = tx_pair.1.wait(guard).unwrap();
             drop(c_guard);
-            match sender.send_await_timeout(1 as u32, 20) {
+            match sender.send_await_timeout(1 as u32, Duration::from_millis(20)) {
                 Ok(_) => assert!(true),
                 e => assert!(false, "Error {:?} when receive.", e),
             };
@@ -1470,7 +1575,7 @@ mod tests {
         // The channel size is intentionally small to force wait conditions.
         let message_count = 10000;
         let capacity = 10;
-        let (sender, receiver) = create::<u32>(capacity, 20);
+        let (sender, receiver) = create::<u32>(capacity, Duration::from_millis(20));
 
         let debug_if_needed = |core: Arc<SeccCore<u32>>| {
             if core.receivable.load(Ordering::Relaxed) > core.capacity {
@@ -1488,7 +1593,7 @@ mod tests {
             .spawn(move || {
                 let mut count = 0;
                 while count < message_count {
-                    match receiver1.receive_await_timeout(20) {
+                    match receiver1.receive_await_timeout(Duration::from_millis(20)) {
                         Ok(_) => {
                             debug_if_needed(receiver1.core.clone());
                             count += 1;
@@ -1504,7 +1609,7 @@ mod tests {
             .name("S1".into())
             .spawn(move || {
                 for i in 0..(message_count / 3) {
-                    match sender1.send_await_timeout(i, 20) {
+                    match sender1.send_await_timeout(i, Duration::from_millis(20)) {
                         Ok(_c) => {
                             debug_if_needed(sender1.core.clone());
                             ()
@@ -1520,7 +1625,7 @@ mod tests {
             .name("S2".into())
             .spawn(move || {
                 for i in (message_count / 3)..((message_count / 3) * 2) {
-                    match sender2.send_await_timeout(i, 20) {
+                    match sender2.send_await_timeout(i, Duration::from_millis(20)) {
                         Ok(_c) => {
                             debug_if_needed(sender2.core.clone());
                             ()
@@ -1536,7 +1641,7 @@ mod tests {
             .name("S3".into())
             .spawn(move || {
                 for i in ((message_count / 3) * 2)..(message_count) {
-                    match sender3.send_await_timeout(i, 20) {
+                    match sender3.send_await_timeout(i, Duration::from_millis(20)) {
                         Ok(_c) => {
                             debug_if_needed(sender3.core.clone());
                             ()
