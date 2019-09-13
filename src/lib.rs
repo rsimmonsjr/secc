@@ -297,9 +297,10 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
                     };
                     let next_read_pos = self.core.nodes[read_index].next.load(Ordering::SeqCst);
                     if NIL != next_read_pos {
-                        let result = condvar.wait_timeout(receive_ptrs, dur).unwrap();
+                        // Drops the guard as we don't need the lock here.
+                        let timed_out = condvar.wait_timeout(receive_ptrs, dur).unwrap().1;
                         self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
-                        if result.1.timed_out() {
+                        if timed_out.timed_out() {
                             // We will try one more time to send in case we missed a notify.
                             return self.send(message);
                         }
@@ -477,9 +478,9 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
                     if NIL != next_pool_head {
                         // In this case there is still nothing to read so we set up a Condvar
                         // and wait for the sender to notify us of new available messages.
-                        let result = condvar.wait_timeout(send_ptrs, dur).unwrap();
-                        self.core.awaited_messages.fetch_add(1, Ordering::SeqCst);
-                        if result.1.timed_out() {
+                        let timed_out = condvar.wait_timeout(send_ptrs, dur).unwrap().1;
+                        self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
+                        if timed_out.timed_out() {
                             // Try one more time at the end of the timeout in case we missed
                             // a notification.
                             return self.receive();
