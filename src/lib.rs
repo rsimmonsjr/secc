@@ -695,12 +695,11 @@ pub fn create<T: Sync + Send + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use log::info;
     use log::LevelFilter;
     use std::sync::MutexGuard;
     use std::thread;
     use std::thread::JoinHandle;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     pub fn init_test_log() {
         let _ = env_logger::builder()
@@ -1439,79 +1438,6 @@ mod tests {
         assert_eq!(0, receiver.receivable());
     }
 
-    fn counted_sender<T: Sync + Send + Clone + 'static>(
-        sender: SeccSender<T>,
-        pair: Arc<(Mutex<bool>, Condvar)>,
-        message: T,
-        count: usize,
-    ) -> JoinHandle<()> {
-        thread::spawn(move || {
-            let (ref mutex, ref condvar) = &*pair;
-            let mut started = mutex.lock().unwrap();
-            while !*started {
-                started = condvar.wait(started).unwrap();
-            }
-
-            while sender.sent() < count {
-                println!("<<< sent: {}", sender.sent());
-                let _result = sender.send_await(message.clone());
-            }
-            println!("---> sender done");
-        })
-    }
-
-    fn counted_receiver(
-        receiver: SeccReceiver<u32>,
-        pair: Arc<(Mutex<bool>, Condvar)>,
-        count: usize,
-    ) -> JoinHandle<()> {
-        thread::spawn(move || {
-            let (ref mutex, ref condvar) = &*pair;
-            let mut started = mutex.lock().unwrap();
-            while !*started {
-                started = condvar.wait(started).unwrap();
-            }
-
-            while receiver.received() < count {
-                println!("<<< received: {}", receiver.received());
-                let _result = receiver.receive_await();
-            }
-            println!("---> sender done");
-        })
-    }
-
-    /// Test conditions to make sure the channel doesn't lock up under stress as shown by
-    /// issue 13.
-    #[test]
-    fn test_multiple_receiver_single_producer() {
-        init_test_log();
-        const COUNT: usize = 10000;
-
-        let (sender, receiver) = create::<u32>(10, Duration::from_millis(1));
-
-        let pair = Arc::new((Mutex::new(false), Condvar::new()));
-
-        let rx_thread1 = counted_receiver(receiver.clone(), pair.clone(), COUNT);
-        let rx_thread2 = counted_receiver(receiver.clone(), pair.clone(), COUNT);
-        let tx_thread = counted_sender(sender.clone(), pair.clone(), 7 as u32, COUNT);
-
-        thread::sleep(Duration::from_millis(1)); // gives threads time to start.
-        let (ref mutex, ref condvar) = &*pair;
-        let mut started = mutex.lock().unwrap();
-        *started = true;
-        condvar.notify_all();
-        drop(started);
-
-        tx_thread.join().unwrap();
-        rx_thread1.join().unwrap();
-        rx_thread2.join().unwrap();
-        println!(
-            "---> test sent {}, and received {} messages.",
-            sender.sent(),
-            sender.received()
-        );
-    }
-
     #[test]
     fn test_receive_concurrent_send() {
         init_test_log();
@@ -1566,101 +1492,111 @@ mod tests {
         assert_eq!(0, receiver.receivable());
     }
 
-    #[test]
-    fn test_multiple_producer_single_receiver() {
-        init_test_log();
-
-        // Tests that the channel can handle multiple producers with a single receiver and that
-        // the senders will properly wait for capacity as well as receivers waiting for messages.
-        // The channel size is intentionally small to force wait conditions.
-        let message_count = 10000;
-        let capacity = 10;
-        let (sender, receiver) = create::<u32>(capacity, Duration::from_millis(20));
-
-        let debug_if_needed = |core: Arc<SeccCore<u32>>| {
-            if core.receivable.load(Ordering::Relaxed) > core.capacity {
-                println!(
-                    "{}: {}",
-                    thread::current().name().unwrap(),
-                    debug_channel(core)
-                );
+    fn counted_sender<T: Sync + Send + Clone + 'static>(
+        sender: SeccSender<T>,
+        pair: Arc<(Mutex<bool>, Condvar)>,
+        message: T,
+        count: usize,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let (ref mutex, ref condvar) = &*pair;
+            let mut started = mutex.lock().unwrap();
+            while !*started {
+                started = condvar.wait(started).unwrap();
             }
-        };
 
-        let receiver1 = receiver.clone();
-        let rx = thread::Builder::new()
-            .name("R1".into())
-            .spawn(move || {
-                let mut count = 0;
-                while count < message_count {
-                    match receiver1.receive_await_timeout(Duration::from_millis(20)) {
-                        Ok(_) => {
-                            debug_if_needed(receiver1.core.clone());
-                            count += 1;
-                        }
-                        _ => (),
-                    };
-                }
-            })
-            .unwrap();
+            while sender.sent() < count {
+                println!("<<< sent: {}", sender.sent());
+                let _result = sender.send_await(message.clone());
+            }
+            println!("---> sender done");
+        })
+    }
 
-        let sender1 = sender.clone();
-        let tx = thread::Builder::new()
-            .name("S1".into())
-            .spawn(move || {
-                for i in 0..(message_count / 3) {
-                    match sender1.send_await_timeout(i, Duration::from_millis(20)) {
-                        Ok(_c) => {
-                            debug_if_needed(sender1.core.clone());
-                            ()
-                        }
-                        Err(e) => assert!(false, "----> Error while sending: {}:{:?}", i, e),
-                    }
-                }
-            })
-            .unwrap();
+    fn counted_receiver<T: Sync + Send + Clone + 'static>(
+        receiver: SeccReceiver<T>,
+        pair: Arc<(Mutex<bool>, Condvar)>,
+        count: usize,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let (ref mutex, ref condvar) = &*pair;
+            let mut started = mutex.lock().unwrap();
+            while !*started {
+                started = condvar.wait(started).unwrap();
+            }
 
-        let sender2 = sender.clone();
-        let tx2 = thread::Builder::new()
-            .name("S2".into())
-            .spawn(move || {
-                for i in (message_count / 3)..((message_count / 3) * 2) {
-                    match sender2.send_await_timeout(i, Duration::from_millis(20)) {
-                        Ok(_c) => {
-                            debug_if_needed(sender2.core.clone());
-                            ()
-                        }
-                        Err(e) => assert!(false, "----> Error while sending: {}:{:?}", i, e),
-                    }
-                }
-            })
-            .unwrap();
+            while receiver.received() < count {
+                println!("<<< received: {}", receiver.received());
+                let _result = receiver.receive_await();
+            }
+            println!("---> sender done");
+        })
+    }
 
-        let sender3 = sender.clone();
-        let tx3 = thread::Builder::new()
-            .name("S3".into())
-            .spawn(move || {
-                for i in ((message_count / 3) * 2)..(message_count) {
-                    match sender3.send_await_timeout(i, Duration::from_millis(20)) {
-                        Ok(_c) => {
-                            debug_if_needed(sender3.core.clone());
-                            ()
-                        }
-                        Err(e) => assert!(false, "----> Error while sending: {}:{:?}", i, e),
-                    }
-                }
-            })
-            .unwrap();
+    fn multiple_thread_helper<T: Sync + Send + Clone + 'static>(
+        receiver_count: u8,
+        sender_count: u8,
+        message_count: usize,
+        time_limit: Duration,
+        message: T,
+    ) {
+        let (sender, receiver) = create::<T>(10, Duration::from_millis(1));
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let total_thread_count: usize = receiver_count as usize + sender_count as usize;
+        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(total_thread_count);
 
-        tx.join().unwrap();
-        tx2.join().unwrap();
-        tx3.join().unwrap();
-        rx.join().unwrap();
+        for _ in 0..receiver_count {
+            handles.push(counted_receiver(
+                receiver.clone(),
+                pair.clone(),
+                message_count,
+            ));
+        }
 
-        info!(
-            "All messages complete: awaited_messages: {}, awaited_capacity: {}",
-            receiver.awaited_messages(),
-            sender.awaited_capacity()
+        for _ in 0..sender_count {
+            handles.push(counted_sender(
+                sender.clone(),
+                pair.clone(),
+                message.clone(),
+                message_count,
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(10)); // gives threads time to start.
+        let (ref mutex, ref condvar) = &*pair;
+        let mut started = mutex.lock().unwrap();
+        *started = true;
+        condvar.notify_all();
+        drop(started);
+
+        let start = Instant::now();
+        while sender.sent() < message_count && receiver.received() < message_count {
+            if Instant::elapsed(&start) > time_limit {
+                panic!("Test took more than {:?} ms to run!", time_limit);
+            }
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        println!(
+            "---> test sent {}, and received {} messages.",
+            sender.sent(),
+            sender.received()
         );
+    }
+
+    /// Tests channel under mutliple receivers and a single sender.
+    #[test]
+    fn test_multiple_receiver_single_sender() {
+        init_test_log();
+        multiple_thread_helper(2, 1, 10_000, Duration::from_millis(10000), 7 as u32);
+    }
+
+    #[test]
+    fn test_multiple_sender_single_receiver() {
+        init_test_log();
+        multiple_thread_helper(1, 3, 10_000, Duration::from_millis(20), 7 as u32);
     }
 }
