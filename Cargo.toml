@@ -2,7 +2,7 @@
 
 [package]
 name = "secc"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2018"
 authors = ["Robert Simmons Jr. MSc."]
 license = "Apache-2.0"
@@ -11,7 +11,7 @@ repository = "https://github.com/rsimmonsjr/secc"
 documentation = "https://docs.rs/secc"
 readme = "README.md"
 description = """
-Implements a Skip-Enabled Concurrent Channel for Rust
+Implements a Skip-Enabled Concurrent Channel (SECC) for Rust
 """
 
 keywords = [
@@ -39,7 +39,5 @@ is-it-maintained-open-issues  = {repository = "rsimmonsjr/secc" }
 maintenance = { status = "actively-developed" }
 
 [dev-dependencies]
-env_logger = "^0.6.2"
 
 [dependencies]
-log ="^0.4.8"
