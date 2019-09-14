@@ -27,7 +27,7 @@
 //! # Examples
 //! ```rust
 //! use secc::*;
-//! use std::time::Duration
+//! use std::time::Duration;
 //!
 //! let channel = create::<u8>(5, Duration::from_millis(10));
 //! let (sender, receiver) = channel;
@@ -1590,4 +1590,12 @@ mod tests {
         init_test_log();
         multiple_thread_helper(1, 3, 10_000, Duration::from_millis(1000), 7 as u32);
     }
+
+    /// Tests channel under mutliple receivers and a single sender.
+    #[test]
+    fn test_multiple_receiver_multiple_sender() {
+        init_test_log();
+        multiple_thread_helper(3, 3, 10_000, Duration::from_millis(1000), 7 as u32);
+    }
+
 }
