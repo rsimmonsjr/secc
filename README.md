@@ -10,6 +10,11 @@ An Skip Enabled Concurrent Channel (SECC) is a bounded capacity channel that sup
 senders and multiple recievers and allows the receiver to temporarily skip receiving messages 
 if they desire.
 
+Messages in the channel need to be clonable to implement the [`peek`] functionality (which
+returns a clone of the message). For this reason it is advisable that the user chose a type
+that is efficiently clonable, such as an [`Arc`] to enclose a message that cannot be 
+efficiently cloned.
+
 The channel is a FIFO structure unless the user intends to skip one or more messages
 in which case a message could be read in a different order. The channel does, however,
 guarantee that the messages will remain in the same order as sent and, unless skipped, will
