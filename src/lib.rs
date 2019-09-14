@@ -326,10 +326,9 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
                     let next_read_pos = self.core.nodes[read_index].next.load(Ordering::SeqCst);
                     if NIL != next_read_pos {
                         // Drops the guard as we don't need the lock here.
-                        let (guard, result) = condvar.wait_timeout(receive_ptrs, timeout).unwrap();
+                        let (_, result) = condvar.wait_timeout(receive_ptrs, timeout).unwrap();
                         self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
                         if result.timed_out() {
-                            // println!("{:?} ===> send timed out", Instant::now());
                             // We will try one more time to send in case we missed a notify.
                             return self.send(message);
                         }
@@ -506,10 +505,9 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
                     if NIL != next_pool_head {
                         // In this case there is still nothing to read so we set up a Condvar
                         // and wait for the sender to notify us of new available messages.
-                        let (guard, result) = condvar.wait_timeout(send_ptrs, timeout).unwrap();
+                        let (_, result) = condvar.wait_timeout(send_ptrs, timeout).unwrap();
                         self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
                         if result.timed_out() {
-                            // println!("{:?} ===> receive timed out", std::time::Instant::now());
                             // Try one more time at the end of the timeout in case we missed
                             // a notification.
                             return self.receive();
@@ -1504,12 +1502,11 @@ mod tests {
             while !*started {
                 started = condvar.wait(started).unwrap();
             }
+            drop(started);
 
             while sender.sent() < count {
-                println!("<<< sent: {}", sender.sent());
-                let _result = sender.send_await(message.clone());
+                let _result = sender.send_await_timeout(message.clone(), Duration::from_millis(1));
             }
-            println!("---> sender done");
         })
     }
 
@@ -1524,12 +1521,11 @@ mod tests {
             while !*started {
                 started = condvar.wait(started).unwrap();
             }
+            drop(started);
 
             while receiver.received() < count {
-                println!("<<< received: {}", receiver.received());
-                let _result = receiver.receive_await();
+                let _result = receiver.receive_await_timeout(Duration::from_millis(1));
             }
-            println!("---> sender done");
         })
     }
 
@@ -1591,7 +1587,7 @@ mod tests {
     #[test]
     fn test_multiple_receiver_single_sender() {
         init_test_log();
-        multiple_thread_helper(2, 1, 10_000, Duration::from_millis(10000), 7 as u32);
+        multiple_thread_helper(2, 1, 10_000, Duration::from_millis(1000), 7 as u32);
     }
 
     #[test]
