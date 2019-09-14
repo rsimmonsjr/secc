@@ -70,7 +70,7 @@
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// A message that is used to indicate that a position index points to no other node. Note that
@@ -254,6 +254,28 @@ impl<T: Sync + Send + Clone> Clone for SeccSender<T> {
 }
 
 impl<T: Sync + Send + Clone> SeccSender<T> {
+    /// Creates a debug string for diagnosing problems with the send side of the channel. Note
+    /// that this requires the user to pass the mutex lock because Rust mutex locks are not
+    /// re-entrant so this cannot be done with a derive Debug.
+    fn debug_locked(&self, send_ptrs: &MutexGuard<SeccSendPtrs>) -> String {
+        let mut pool = Vec::with_capacity(self.core.capacity);
+        pool.push(send_ptrs.pool_head);
+        let mut next_ptr = self.core.nodes[send_ptrs.pool_head]
+            .next
+            .load(Ordering::SeqCst);
+        let mut count = 1;
+        while next_ptr != NIL {
+            count += 1;
+            pool.push(next_ptr);
+            next_ptr = self.core.nodes[next_ptr].next.load(Ordering::SeqCst);
+        }
+
+        format!(
+            "send_ptrs: {:?}, pool_size: {}, pool: {:?}",
+            send_ptrs, count, pool
+        )
+    }
+
     /// Sends a message, which will be moved into the channel. This function will either return
     /// an empty [`std::Result::Ok`] or an [`std::Result::Err`] containing the last message
     /// sent if something went wrong.
@@ -360,6 +382,17 @@ impl<T: Sync + Send + Clone> SeccCoreOps<T> for SeccSender<T> {
     }
 }
 
+/// This function will write a debug string for the receiver but be warned that it will acquire
+/// the mutex lock to the receive_ptrs to accomplish this so a deadlock could ensue if you have
+/// two threads asking for debug on both send and receive.
+impl<T: Sync + Send + Clone> fmt::Debug for SeccSender<T> {
+    fn fmt(&self, formatter: &'_ mut fmt::Formatter) -> fmt::Result {
+        let (ref mutex, _) = &*self.core.send_ptrs;
+        let send_ptrs = mutex.lock().unwrap();
+        write!(formatter, "{}", self.debug_locked(&send_ptrs))
+    }
+}
+
 unsafe impl<T: Send + Sync + Clone> Send for SeccSender<T> {}
 
 unsafe impl<T: Send + Sync + Clone> Sync for SeccSender<T> {}
@@ -381,6 +414,28 @@ impl<T: Sync + Send + Clone> Clone for SeccReceiver<T> {
 }
 
 impl<T: Sync + Send + Clone> SeccReceiver<T> {
+    /// Creates a debug string for diagnosing problems with the receive side of the channel.
+    /// This requires the user to pass the mutex guard for the lock of the receive side of the
+    /// channel because rust mutex locks are not re-entrant.
+    fn debug_locked(&self, receive_ptrs: &MutexGuard<SeccReceivePtrs>) -> String {
+        let mut queue = Vec::with_capacity(self.core.capacity);
+        let mut next_ptr = self.core.nodes[receive_ptrs.queue_head]
+            .next
+            .load(Ordering::SeqCst);
+        queue.push(receive_ptrs.queue_head);
+        let mut count = 1;
+        while next_ptr != NIL {
+            count += 1;
+            queue.push(next_ptr);
+            next_ptr = self.core.nodes[next_ptr].next.load(Ordering::SeqCst);
+        }
+
+        format!(
+            "receive_ptrs: {:?}, queue_size: {}, queue: {:?}",
+            receive_ptrs, count, queue
+        )
+    }
+
     /// Peeks at the next receivable message in the channel and returns a Clone of the message.
     /// Note that the message isn't guaranteed to stay in the channel as a thread could pop the
     /// message off while another user is looking at the value but the value shouldn't change
@@ -617,6 +672,17 @@ impl<T: Sync + Send + Clone> SeccCoreOps<T> for SeccReceiver<T> {
     }
 }
 
+/// This function will write a debug string for the receiver but be warned that it will acquire
+/// the mutex lock to the receive_ptrs to accomplish this so a deadlock could ensue if you have
+/// two threads asking for debug on both send and receive.
+impl<T: Sync + Send + Clone> fmt::Debug for SeccReceiver<T> {
+    fn fmt(&self, formatter: &'_ mut fmt::Formatter) -> fmt::Result {
+        let (ref mutex, _) = &*self.core.receive_ptrs;
+        let receive_ptrs = mutex.lock().unwrap();
+        write!(formatter, "{}", self.debug_locked(&receive_ptrs))
+    }
+}
+
 unsafe impl<T: Send + Sync + Clone> Send for SeccReceiver<T> {}
 
 unsafe impl<T: Send + Sync + Clone> Sync for SeccReceiver<T> {}
@@ -695,7 +761,6 @@ pub fn create<T: Sync + Send + Clone>(
 mod tests {
     use super::*;
     use log::LevelFilter;
-    use std::sync::MutexGuard;
     use std::thread;
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
@@ -719,7 +784,7 @@ mod tests {
             $skipped:expr,
             $cursor:expr
         ) => {{
-            let actual = debug_channel($sender.core.clone());
+            let actual = debug_channel($sender.clone(), $receiver.clone());
             let (ref mutex, _) = &*$sender.core.send_ptrs;
             let send_ptrs = mutex.lock().unwrap();
             let (ref mutex, _) = &*$receiver.core.receive_ptrs;
@@ -772,63 +837,12 @@ mod tests {
         };
     }
 
-    /// Creates a debug string for diagnosing problems with the send side of the channel.
-    fn debug_send<T: Send + Sync + Clone>(
-        core: Arc<SeccCore<T>>,
-        send_ptrs: MutexGuard<SeccSendPtrs>,
-    ) -> String {
-        let mut pool = Vec::with_capacity(core.capacity);
-        pool.push(send_ptrs.pool_head);
-        let mut next_ptr = core.nodes[send_ptrs.pool_head].next.load(Ordering::SeqCst);
-        let mut count = 1;
-        while next_ptr != NIL {
-            count += 1;
-            pool.push(next_ptr);
-            next_ptr = core.nodes[next_ptr].next.load(Ordering::SeqCst);
-        }
-
-        format!(
-            "send_ptrs: {:?}, pool_size: {}, pool: {:?}",
-            send_ptrs, count, pool
-        )
-    }
-
-    /// Creates a debug string for diagnosing problems with the receive side of the channel.
-    fn debug_receive<T: Send + Sync + Clone>(
-        core: Arc<SeccCore<T>>,
-        receive_ptrs: MutexGuard<SeccReceivePtrs>,
-    ) -> String {
-        let mut queue = Vec::with_capacity(core.capacity);
-        let mut next_ptr = core.nodes[receive_ptrs.queue_head]
-            .next
-            .load(Ordering::SeqCst);
-        queue.push(receive_ptrs.queue_head);
-        let mut count = 1;
-        while next_ptr != NIL {
-            count += 1;
-            queue.push(next_ptr);
-            next_ptr = core.nodes[next_ptr].next.load(Ordering::SeqCst);
-        }
-
-        format!(
-            "receive_ptrs: {:?}, queue_size: {}, queue: {:?}",
-            receive_ptrs, count, queue
-        )
-    }
-
     /// Creates a debug string for debugging channel problems.
-    pub fn debug_channel<T: Send + Sync + Clone>(core: Arc<SeccCore<T>>) -> String {
-        let r = core.receivable.load(Ordering::Relaxed);
-        let (ref mutex, _) = &*core.receive_ptrs;
-        let receive_ptrs = mutex.lock().unwrap();
-        let (ref mutex, _) = &*core.send_ptrs;
-        let send_ptrs = mutex.lock().unwrap();
-        format!(
-            "Receivable: {}, {}, {}",
-            r,
-            debug_receive(core.clone(), receive_ptrs),
-            debug_send(core.clone(), send_ptrs)
-        )
+    pub fn debug_channel<T: Send + Sync + Clone>(
+        sender: SeccSender<T>,
+        receiver: SeccReceiver<T>,
+    ) -> String {
+        format!("{{ Sender: {:?}, Receiver: {:?} }}", sender, receiver)
     }
 
     #[derive(Debug, Eq, PartialEq, Clone)]
