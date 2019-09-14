@@ -337,24 +337,11 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
                     // We will put a condvar on the mutex to be notified if space opens up.
                     let (ref mutex, ref condvar) = &*self.core.receive_ptrs;
                     let receive_ptrs = mutex.lock().unwrap();
-
-                    // We will check if something got received before this function could create
-                    // the condvar. This would mean we missed the condvar message and space is
-                    // available to send.
-                    let read_index = if receive_ptrs.cursor == NIL {
-                        receive_ptrs.queue_head
-                    } else {
-                        receive_ptrs.cursor
-                    };
-                    let next_read_pos = self.core.nodes[read_index].next.load(Ordering::SeqCst);
-                    if NIL != next_read_pos {
-                        // Drops the guard as we don't need the lock here.
-                        let (_, result) = condvar.wait_timeout(receive_ptrs, timeout).unwrap();
-                        self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
-                        if result.timed_out() {
-                            // We will try one more time to send in case we missed a notify.
-                            return self.send(message);
-                        }
+                    let (_, result) = condvar.wait_timeout(receive_ptrs, timeout).unwrap();
+                    self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
+                    if result.timed_out() {
+                        // We will try one more time to send in case we missed a notify.
+                        return self.send(message);
                     }
                 }
                 v => return v,
@@ -551,23 +538,12 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
                 Err(SeccErrors::Empty) => {
                     let (ref mutex, ref condvar) = &*self.core.send_ptrs;
                     let send_ptrs = mutex.lock().unwrap();
-
-                    // We will check if something got sent to the channel before this function
-                    // could create the Condvar and thus the function missed the Condvar notify
-                    // and there is content to read.
-                    let next_pool_head = self.core.nodes[send_ptrs.pool_head]
-                        .next
-                        .load(Ordering::SeqCst);
-                    if NIL != next_pool_head {
-                        // In this case there is still nothing to read so we set up a Condvar
-                        // and wait for the sender to notify us of new available messages.
-                        let (_, result) = condvar.wait_timeout(send_ptrs, timeout).unwrap();
-                        self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
-                        if result.timed_out() {
-                            // Try one more time at the end of the timeout in case we missed
-                            // a notification.
-                            return self.receive();
-                        }
+                    let (_, result) = condvar.wait_timeout(send_ptrs, timeout).unwrap();
+                    self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
+                    if result.timed_out() {
+                        // Try one more time at the end of the timeout in case we missed
+                        // a notification.
+                        return self.receive();
                     }
                 }
                 v => return v,
