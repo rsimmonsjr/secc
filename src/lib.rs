@@ -27,6 +27,7 @@
 //! # Examples
 //! ```rust
 //! use secc::*;
+//! use std::time::Duration
 //!
 //! let channel = create::<u8>(5, Duration::from_millis(10));
 //! let (sender, receiver) = channel;
@@ -1505,7 +1506,7 @@ mod tests {
             drop(started);
 
             while sender.sent() < count {
-                let _result = sender.send_await_timeout(message.clone(), Duration::from_millis(1));
+                let _ = sender.send_await_timeout(message.clone(), Duration::from_millis(10));
             }
         })
     }
@@ -1524,7 +1525,7 @@ mod tests {
             drop(started);
 
             while receiver.received() < count {
-                let _result = receiver.receive_await_timeout(Duration::from_millis(1));
+                let _ = receiver.receive_await_timeout(Duration::from_millis(10));
             }
         })
     }
@@ -1575,12 +1576,6 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-
-        println!(
-            "---> test sent {}, and received {} messages.",
-            sender.sent(),
-            sender.received()
-        );
     }
 
     /// Tests channel under mutliple receivers and a single sender.
@@ -1593,6 +1588,6 @@ mod tests {
     #[test]
     fn test_multiple_sender_single_receiver() {
         init_test_log();
-        multiple_thread_helper(1, 3, 10_000, Duration::from_millis(20), 7 as u32);
+        multiple_thread_helper(1, 3, 10_000, Duration::from_millis(1000), 7 as u32);
     }
 }
