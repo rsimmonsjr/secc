@@ -27,8 +27,9 @@
 //! # Examples
 //! ```rust
 //! use secc::*;
+//! use std::time::Duration;
 //!
-//! let channel = create::<u8>(5, 10);
+//! let channel = create::<u8>(5, Duration::from_millis(10));
 //! let (sender, receiver) = channel;
 //! assert_eq!(Ok(()), sender.send(17));
 //! assert_eq!(Ok(()), sender.send(19));
@@ -40,11 +41,36 @@
 //! assert_eq!(Ok(()), receiver.reset_skip());
 //! assert_eq!(Ok(19), receiver.receive());
 //! ```
+//! This code creates the channel and then sends it a series of messages. The first is received
+//! normally but then the user wants to skip the next message. The user can then receive in
+//! the middle of the channel, reset the skip and resume receiving normally.
+//!
+//!
+//! ### Design Principals
+//!
+//! SECC was driven by the need for a multi-sender, multi-consumer channel that would have the
+//! ability to skip processing messages. There are many situation in which this is needed by a
+//! consumer such as the use case with Axiom where actors implement a finite state machine. That
+//! led me to go through many iterations of different designs until it became clear that a linked
+//! list was the only legitimate approach. The problem with a linked lists is that they typically
+//! burn a lot of CPU time in allocating new nodes on each enqueue. The solution was to use two
+//! linked lists, allocate all nodes up front and just logically move nodes around. The actual
+//! pointers to the next node or the various heads and tails are the indexes in the statically
+//! allocated slice of nodes. When send and receive operations happen, nodes are merely moved
+//! around logically but not physically.
+//!
+//! ### What's New
+//! * 2019-09-13: 0.0.10
+//!   * Issue #13: A Deadlock would occur if the timeout occurred while waiting for space or data.
+//! * 2019-08-18: 0.0.9
+//!   * Most `unsafe` code has been eliminated, enhancing stability.
+//!
+//! [Release Notes for All Versions](https://github.com/rsimmonsjr/secc/blob/master/RELEASE_NOTES.md)
 
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// A message that is used to indicate that a position index points to no other node. Note that
@@ -181,7 +207,7 @@ pub struct SeccCore<T: Sync + Send + Clone> {
     /// be empty.
     capacity: usize,
     /// The timeout used for polling the channel when waiting forever to send or recieve.
-    poll_ms: u16,
+    poll_timeout: Duration,
     /// Storage of the nodes. Note this field is preceded with an underscore because although
     /// the nodes live here they are never used directly once allocated.
     nodes: Box<[SeccNode<T>]>,
@@ -228,6 +254,28 @@ impl<T: Sync + Send + Clone> Clone for SeccSender<T> {
 }
 
 impl<T: Sync + Send + Clone> SeccSender<T> {
+    /// Creates a debug string for diagnosing problems with the send side of the channel. Note
+    /// that this requires the user to pass the mutex lock because Rust mutex locks are not
+    /// re-entrant so this cannot be done with a derive Debug.
+    fn debug_locked(&self, send_ptrs: &MutexGuard<SeccSendPtrs>) -> String {
+        let mut pool = Vec::with_capacity(self.core.capacity);
+        pool.push(send_ptrs.pool_head);
+        let mut next_ptr = self.core.nodes[send_ptrs.pool_head]
+            .next
+            .load(Ordering::SeqCst);
+        let mut count = 1;
+        while next_ptr != NIL {
+            count += 1;
+            pool.push(next_ptr);
+            next_ptr = self.core.nodes[next_ptr].next.load(Ordering::SeqCst);
+        }
+
+        format!(
+            "send_ptrs: {:?}, pool_size: {}, pool: {:?}",
+            send_ptrs, count, pool
+        )
+    }
+
     /// Sends a message, which will be moved into the channel. This function will either return
     /// an empty [`std::Result::Ok`] or an [`std::Result::Err`] containing the last message
     /// sent if something went wrong.
@@ -277,32 +325,23 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
     /// function is semantically identical to [`SeccSender::send`] but simply waits
     /// for there to be space in the channel before sending. If the timeout is not provided this
     /// function will wait forever for capacity.
-    pub fn send_await_timeout(&self, mut message: T, timeout_ms: u16) -> Result<(), SeccErrors<T>> {
+    pub fn send_await_timeout(
+        &self,
+        mut message: T,
+        timeout: Duration,
+    ) -> Result<(), SeccErrors<T>> {
         loop {
             match self.send(message) {
                 Err(SeccErrors::Full(v)) => {
                     message = v;
-                    let dur = Duration::from_millis(timeout_ms as u64);
                     // We will put a condvar on the mutex to be notified if space opens up.
                     let (ref mutex, ref condvar) = &*self.core.receive_ptrs;
                     let receive_ptrs = mutex.lock().unwrap();
-
-                    // We will check if something got received before this function could create
-                    // the condvar. This would mean we missed the condvar message and space is
-                    // available to send.
-                    let read_index = if receive_ptrs.cursor == NIL {
-                        receive_ptrs.queue_head
-                    } else {
-                        receive_ptrs.cursor
-                    };
-                    let next_read_pos = self.core.nodes[read_index].next.load(Ordering::SeqCst);
-                    if NIL != next_read_pos {
-                        let result = condvar.wait_timeout(receive_ptrs, dur).unwrap();
-                        self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
-                        if result.1.timed_out() {
-                            // We will try one more time to send in case we missed a notify.
-                            return self.send(message);
-                        }
+                    let (_, result) = condvar.wait_timeout(receive_ptrs, timeout).unwrap();
+                    self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
+                    if result.timed_out() {
+                        // We will try one more time to send in case we missed a notify.
+                        return self.send(message);
                     }
                 }
                 v => return v,
@@ -314,7 +353,7 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
     // milliseconds passed when creating the channel.
     pub fn send_await(&self, mut message: T) -> Result<(), SeccErrors<T>> {
         loop {
-            match self.send_await_timeout(message, self.core.poll_ms) {
+            match self.send_await_timeout(message, self.core.poll_timeout) {
                 Err(SeccErrors::Full(v)) => {
                     message = v;
                 }
@@ -327,6 +366,17 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
 impl<T: Sync + Send + Clone> SeccCoreOps<T> for SeccSender<T> {
     fn core(&self) -> &SeccCore<T> {
         &self.core
+    }
+}
+
+/// This function will write a debug string for the receiver but be warned that it will acquire
+/// the mutex lock to the receive_ptrs to accomplish this so a deadlock could ensue if you have
+/// two threads asking for debug on both send and receive.
+impl<T: Sync + Send + Clone> fmt::Debug for SeccSender<T> {
+    fn fmt(&self, formatter: &'_ mut fmt::Formatter) -> fmt::Result {
+        let (ref mutex, _) = &*self.core.send_ptrs;
+        let send_ptrs = mutex.lock().unwrap();
+        write!(formatter, "{}", self.debug_locked(&send_ptrs))
     }
 }
 
@@ -351,6 +401,28 @@ impl<T: Sync + Send + Clone> Clone for SeccReceiver<T> {
 }
 
 impl<T: Sync + Send + Clone> SeccReceiver<T> {
+    /// Creates a debug string for diagnosing problems with the receive side of the channel.
+    /// This requires the user to pass the mutex guard for the lock of the receive side of the
+    /// channel because rust mutex locks are not re-entrant.
+    fn debug_locked(&self, receive_ptrs: &MutexGuard<SeccReceivePtrs>) -> String {
+        let mut queue = Vec::with_capacity(self.core.capacity);
+        let mut next_ptr = self.core.nodes[receive_ptrs.queue_head]
+            .next
+            .load(Ordering::SeqCst);
+        queue.push(receive_ptrs.queue_head);
+        let mut count = 1;
+        while next_ptr != NIL {
+            count += 1;
+            queue.push(next_ptr);
+            next_ptr = self.core.nodes[next_ptr].next.load(Ordering::SeqCst);
+        }
+
+        format!(
+            "receive_ptrs: {:?}, queue_size: {}, queue: {:?}",
+            receive_ptrs, count, queue
+        )
+    }
+
     /// Peeks at the next receivable message in the channel and returns a Clone of the message.
     /// Note that the message isn't guaranteed to stay in the channel as a thread could pop the
     /// message off while another user is looking at the value but the value shouldn't change
@@ -460,30 +532,18 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
 
     /// A helper to call [`SeccReceiver::receive`] and await receivable messages
     /// until a specified optional timeout has expired.
-    pub fn receive_await_timeout(&self, timeout_ms: u16) -> Result<T, SeccErrors<T>> {
+    pub fn receive_await_timeout(&self, timeout: Duration) -> Result<T, SeccErrors<T>> {
         loop {
             match self.receive() {
                 Err(SeccErrors::Empty) => {
-                    let dur = Duration::from_millis(timeout_ms as u64);
                     let (ref mutex, ref condvar) = &*self.core.send_ptrs;
                     let send_ptrs = mutex.lock().unwrap();
-
-                    // We will check if something got sent to the channel before this function
-                    // could create the Condvar and thus the function missed the Condvar notify
-                    // and there is content to read.
-                    let next_pool_head = self.core.nodes[send_ptrs.pool_head]
-                        .next
-                        .load(Ordering::SeqCst);
-                    if NIL != next_pool_head {
-                        // In this case there is still nothing to read so we set up a Condvar
-                        // and wait for the sender to notify us of new available messages.
-                        let result = condvar.wait_timeout(send_ptrs, dur).unwrap();
-                        self.core.awaited_messages.fetch_add(1, Ordering::SeqCst);
-                        if result.1.timed_out() {
-                            // Try one more time at the end of the timeout in case we missed
-                            // a notification.
-                            return self.receive();
-                        }
+                    let (_, result) = condvar.wait_timeout(send_ptrs, timeout).unwrap();
+                    self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
+                    if result.timed_out() {
+                        // Try one more time at the end of the timeout in case we missed
+                        // a notification.
+                        return self.receive();
                     }
                 }
                 v => return v,
@@ -496,7 +556,7 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
     // keep polling until it has a result.
     pub fn receive_await(&self) -> Result<T, SeccErrors<T>> {
         loop {
-            match self.receive_await_timeout(10) {
+            match self.receive_await_timeout(self.core.poll_timeout) {
                 Err(SeccErrors::Empty) => (),
                 other => return other,
             }
@@ -588,6 +648,17 @@ impl<T: Sync + Send + Clone> SeccCoreOps<T> for SeccReceiver<T> {
     }
 }
 
+/// This function will write a debug string for the receiver but be warned that it will acquire
+/// the mutex lock to the receive_ptrs to accomplish this so a deadlock could ensue if you have
+/// two threads asking for debug on both send and receive.
+impl<T: Sync + Send + Clone> fmt::Debug for SeccReceiver<T> {
+    fn fmt(&self, formatter: &'_ mut fmt::Formatter) -> fmt::Result {
+        let (ref mutex, _) = &*self.core.receive_ptrs;
+        let receive_ptrs = mutex.lock().unwrap();
+        write!(formatter, "{}", self.debug_locked(&receive_ptrs))
+    }
+}
+
 unsafe impl<T: Send + Sync + Clone> Send for SeccReceiver<T> {}
 
 unsafe impl<T: Send + Sync + Clone> Sync for SeccReceiver<T> {}
@@ -597,7 +668,7 @@ unsafe impl<T: Send + Sync + Clone> Sync for SeccReceiver<T> {}
 /// wait on the channel will poll.
 pub fn create<T: Sync + Send + Clone>(
     capacity: u16,
-    poll_ms: u16,
+    poll_timeout: Duration,
 ) -> (SeccSender<T>, SeccReceiver<T>) {
     if capacity < 1 {
         panic!("capacity cannot be smaller than 1");
@@ -641,7 +712,7 @@ pub fn create<T: Sync + Send + Clone>(
     // Create the channel structures.
     let core = Arc::new(SeccCore {
         capacity: capacity as usize,
-        poll_ms,
+        poll_timeout,
         nodes: nodes.into_boxed_slice(),
         send_ptrs: Arc::new((Mutex::new(send_ptrs), Condvar::new())),
         receive_ptrs: Arc::new((Mutex::new(receive_ptrs), Condvar::new())),
@@ -665,11 +736,10 @@ pub fn create<T: Sync + Send + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use log::info;
     use log::LevelFilter;
-    use std::sync::MutexGuard;
     use std::thread;
-    use std::time::Duration;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
 
     pub fn init_test_log() {
         let _ = env_logger::builder()
@@ -690,7 +760,7 @@ mod tests {
             $skipped:expr,
             $cursor:expr
         ) => {{
-            let actual = debug_channel($sender.core.clone());
+            let actual = debug_channel($sender.clone(), $receiver.clone());
             let (ref mutex, _) = &*$sender.core.send_ptrs;
             let send_ptrs = mutex.lock().unwrap();
             let (ref mutex, _) = &*$receiver.core.receive_ptrs;
@@ -743,63 +813,12 @@ mod tests {
         };
     }
 
-    /// Creates a debug string for diagnosing problems with the send side of the channel.
-    fn debug_send<T: Send + Sync + Clone>(
-        core: Arc<SeccCore<T>>,
-        send_ptrs: MutexGuard<SeccSendPtrs>,
-    ) -> String {
-        let mut pool = Vec::with_capacity(core.capacity);
-        pool.push(send_ptrs.pool_head);
-        let mut next_ptr = core.nodes[send_ptrs.pool_head].next.load(Ordering::SeqCst);
-        let mut count = 1;
-        while next_ptr != NIL {
-            count += 1;
-            pool.push(next_ptr);
-            next_ptr = core.nodes[next_ptr].next.load(Ordering::SeqCst);
-        }
-
-        format!(
-            "send_ptrs: {:?}, pool_size: {}, pool: {:?}",
-            send_ptrs, count, pool
-        )
-    }
-
-    /// Creates a debug string for diagnosing problems with the receive side of the channel.
-    fn debug_receive<T: Send + Sync + Clone>(
-        core: Arc<SeccCore<T>>,
-        receive_ptrs: MutexGuard<SeccReceivePtrs>,
-    ) -> String {
-        let mut queue = Vec::with_capacity(core.capacity);
-        let mut next_ptr = core.nodes[receive_ptrs.queue_head]
-            .next
-            .load(Ordering::SeqCst);
-        queue.push(receive_ptrs.queue_head);
-        let mut count = 1;
-        while next_ptr != NIL {
-            count += 1;
-            queue.push(next_ptr);
-            next_ptr = core.nodes[next_ptr].next.load(Ordering::SeqCst);
-        }
-
-        format!(
-            "receive_ptrs: {:?}, queue_size: {}, queue: {:?}",
-            receive_ptrs, count, queue
-        )
-    }
-
     /// Creates a debug string for debugging channel problems.
-    pub fn debug_channel<T: Send + Sync + Clone>(core: Arc<SeccCore<T>>) -> String {
-        let r = core.receivable.load(Ordering::Relaxed);
-        let (ref mutex, _) = &*core.receive_ptrs;
-        let receive_ptrs = mutex.lock().unwrap();
-        let (ref mutex, _) = &*core.send_ptrs;
-        let send_ptrs = mutex.lock().unwrap();
-        format!(
-            "Receivable: {}, {}, {}",
-            r,
-            debug_receive(core.clone(), receive_ptrs),
-            debug_send(core.clone(), send_ptrs)
-        )
+    pub fn debug_channel<T: Send + Sync + Clone>(
+        sender: SeccSender<T>,
+        receiver: SeccReceiver<T>,
+    ) -> String {
+        format!("{{ Sender: {:?}, Receiver: {:?} }}", sender, receiver)
     }
 
     #[derive(Debug, Eq, PartialEq, Clone)]
@@ -817,7 +836,7 @@ mod tests {
         use std::num::NonZeroU8;
 
         let value = NonZeroU8::new(5).unwrap();
-        let (tx, rx) = create::<NonZeroU8>(1, 100);
+        let (tx, rx) = create::<NonZeroU8>(1, Duration::from_millis(100));
         tx.send(value).unwrap();
         let item = rx.peek().unwrap();
         assert_eq!(value, item);
@@ -828,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_peek_empty() {
-        let (sender, receiver) = create::<Items>(5, 10);
+        let (sender, receiver) = create::<Items>(5, Duration::from_millis(10));
         assert_eq!(Err(SeccErrors::Empty), receiver.peek());
 
         sender.send(Items::A).unwrap();
@@ -840,7 +859,7 @@ mod tests {
     fn test_pop_while_peeking() {
         // Tests that the user should not be able to pop while another thread is peeking at
         // the data.
-        let (sender, receiver) = create::<Items>(5, 10);
+        let (sender, receiver) = create::<Items>(5, Duration::from_millis(10));
         let peeked = Arc::new((Mutex::new(false), Condvar::new()));
         let popped = Arc::new((Mutex::new(false), Condvar::new()));
 
@@ -893,7 +912,7 @@ mod tests {
         // test wouldn't compile.
         struct Unclonable {}
 
-        let (sender, receiver) = create::<Arc<Unclonable>>(5, 10);
+        let (sender, receiver) = create::<Arc<Unclonable>>(5, Duration::from_millis(10));
         let _s_clone = sender.clone();
         let _r_clone = receiver.clone();
     }
@@ -904,7 +923,7 @@ mod tests {
 
         // This test checks the basic functionality of sending and receiving messages from the
         // channel in a single thread. This is used to verify basic functionality.
-        let channel = create::<Items>(5, 10);
+        let channel = create::<Items>(5, Duration::from_millis(10));
         let (sender, receiver) = channel;
 
         // fetch the pointers for easy checking of the nodes.
@@ -1338,12 +1357,12 @@ mod tests {
         // receivers on different threads.
         let message_count = 200;
         let capacity = 32;
-        let (sender, receiver) = create::<u32>(capacity, 20);
+        let (sender, receiver) = create::<u32>(capacity, Duration::from_millis(20));
 
         let rx = thread::spawn(move || {
             let mut count = 0;
             while count < message_count {
-                match receiver.receive_await_timeout(20) {
+                match receiver.receive_await_timeout(Duration::from_millis(20)) {
                     Ok(_v) => count += 1,
                     _ => (),
                 };
@@ -1352,7 +1371,9 @@ mod tests {
 
         let tx = thread::spawn(move || {
             for i in 0..message_count {
-                sender.send_await_timeout(i, 20).unwrap();
+                sender
+                    .send_await_timeout(i, Duration::from_millis(20))
+                    .unwrap();
                 thread::sleep(Duration::from_millis(1));
             }
         });
@@ -1361,13 +1382,13 @@ mod tests {
         rx.join().unwrap();
     }
 
+    /// Test that if a user attempts to receive before a message is sent, he will be forced
+    /// to wait for the message.
     #[test]
     fn test_receive_before_send() {
         init_test_log();
 
-        // Test that if a user attempts to receive before a message is sent, he will be forced
-        // to wait for the message.
-        let (sender, receiver) = create::<u32>(5, 20);
+        let (sender, receiver) = create::<u32>(5, Duration::from_millis(20));
         let receiver2 = receiver.clone();
         let mutex = Arc::new(Mutex::new(false));
         let rx_mutex = mutex.clone();
@@ -1376,7 +1397,7 @@ mod tests {
             let mut guard = rx_mutex.lock().unwrap();
             *guard = true;
             drop(guard);
-            match receiver2.receive_await_timeout(20) {
+            match receiver2.receive_await_timeout(Duration::from_millis(20)) {
                 Ok(_) => assert!(true),
                 e => assert!(false, "Error {:?} when receive.", e),
             };
@@ -1391,7 +1412,7 @@ mod tests {
         }
 
         let tx = thread::spawn(move || {
-            match sender.send_await_timeout(1, 20) {
+            match sender.send_await_timeout(1, Duration::from_millis(20)) {
                 Ok(_) => assert!(true),
                 e => assert!(false, "Error {:?} when receive.", e),
             };
@@ -1412,7 +1433,7 @@ mod tests {
 
         // Tests that triggering send and receive as close to at the same time as possible does
         // not cause any race conditions.
-        let (sender, receiver) = create::<u32>(5, 20);
+        let (sender, receiver) = create::<u32>(5, Duration::from_millis(20));
         let receiver2 = receiver.clone();
         let pair = Arc::new((Mutex::new((false, false)), Condvar::new()));
         let rx_pair = pair.clone();
@@ -1423,7 +1444,7 @@ mod tests {
             guard.0 = true;
             let c_guard = rx_pair.1.wait(guard).unwrap();
             drop(c_guard);
-            match receiver2.receive_await_timeout(20) {
+            match receiver2.receive_await_timeout(Duration::from_millis(20)) {
                 Ok(_) => assert!(true),
                 e => assert!(false, "Error {:?} when receive.", e),
             };
@@ -1433,7 +1454,7 @@ mod tests {
             guard.1 = true;
             let c_guard = tx_pair.1.wait(guard).unwrap();
             drop(c_guard);
-            match sender.send_await_timeout(1 as u32, 20) {
+            match sender.send_await_timeout(1 as u32, Duration::from_millis(20)) {
                 Ok(_) => assert!(true),
                 e => assert!(false, "Error {:?} when receive.", e),
             };
@@ -1460,101 +1481,111 @@ mod tests {
         assert_eq!(0, receiver.receivable());
     }
 
-    #[test]
-    fn test_multiple_producer_single_receiver() {
-        init_test_log();
-
-        // Tests that the channel can handle multiple producers with a single receiver and that
-        // the senders will properly wait for capacity as well as receivers waiting for messages.
-        // The channel size is intentionally small to force wait conditions.
-        let message_count = 10000;
-        let capacity = 10;
-        let (sender, receiver) = create::<u32>(capacity, 20);
-
-        let debug_if_needed = |core: Arc<SeccCore<u32>>| {
-            if core.receivable.load(Ordering::Relaxed) > core.capacity {
-                println!(
-                    "{}: {}",
-                    thread::current().name().unwrap(),
-                    debug_channel(core)
-                );
+    fn counted_sender<T: Sync + Send + Clone + 'static>(
+        sender: SeccSender<T>,
+        pair: Arc<(Mutex<bool>, Condvar)>,
+        message: T,
+        count: usize,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let (ref mutex, ref condvar) = &*pair;
+            let mut started = mutex.lock().unwrap();
+            while !*started {
+                started = condvar.wait(started).unwrap();
             }
-        };
+            drop(started);
 
-        let receiver1 = receiver.clone();
-        let rx = thread::Builder::new()
-            .name("R1".into())
-            .spawn(move || {
-                let mut count = 0;
-                while count < message_count {
-                    match receiver1.receive_await_timeout(20) {
-                        Ok(_) => {
-                            debug_if_needed(receiver1.core.clone());
-                            count += 1;
-                        }
-                        _ => (),
-                    };
-                }
-            })
-            .unwrap();
-
-        let sender1 = sender.clone();
-        let tx = thread::Builder::new()
-            .name("S1".into())
-            .spawn(move || {
-                for i in 0..(message_count / 3) {
-                    match sender1.send_await_timeout(i, 20) {
-                        Ok(_c) => {
-                            debug_if_needed(sender1.core.clone());
-                            ()
-                        }
-                        Err(e) => assert!(false, "----> Error while sending: {}:{:?}", i, e),
-                    }
-                }
-            })
-            .unwrap();
-
-        let sender2 = sender.clone();
-        let tx2 = thread::Builder::new()
-            .name("S2".into())
-            .spawn(move || {
-                for i in (message_count / 3)..((message_count / 3) * 2) {
-                    match sender2.send_await_timeout(i, 20) {
-                        Ok(_c) => {
-                            debug_if_needed(sender2.core.clone());
-                            ()
-                        }
-                        Err(e) => assert!(false, "----> Error while sending: {}:{:?}", i, e),
-                    }
-                }
-            })
-            .unwrap();
-
-        let sender3 = sender.clone();
-        let tx3 = thread::Builder::new()
-            .name("S3".into())
-            .spawn(move || {
-                for i in ((message_count / 3) * 2)..(message_count) {
-                    match sender3.send_await_timeout(i, 20) {
-                        Ok(_c) => {
-                            debug_if_needed(sender3.core.clone());
-                            ()
-                        }
-                        Err(e) => assert!(false, "----> Error while sending: {}:{:?}", i, e),
-                    }
-                }
-            })
-            .unwrap();
-
-        tx.join().unwrap();
-        tx2.join().unwrap();
-        tx3.join().unwrap();
-        rx.join().unwrap();
-
-        info!(
-            "All messages complete: awaited_messages: {}, awaited_capacity: {}",
-            receiver.awaited_messages(),
-            sender.awaited_capacity()
-        );
+            while sender.sent() < count {
+                let _ = sender.send_await_timeout(message.clone(), Duration::from_millis(10));
+            }
+        })
     }
+
+    fn counted_receiver<T: Sync + Send + Clone + 'static>(
+        receiver: SeccReceiver<T>,
+        pair: Arc<(Mutex<bool>, Condvar)>,
+        count: usize,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let (ref mutex, ref condvar) = &*pair;
+            let mut started = mutex.lock().unwrap();
+            while !*started {
+                started = condvar.wait(started).unwrap();
+            }
+            drop(started);
+
+            while receiver.received() < count {
+                let _ = receiver.receive_await_timeout(Duration::from_millis(10));
+            }
+        })
+    }
+
+    fn multiple_thread_helper<T: Sync + Send + Clone + 'static>(
+        receiver_count: u8,
+        sender_count: u8,
+        message_count: usize,
+        time_limit: Duration,
+        message: T,
+    ) {
+        let (sender, receiver) = create::<T>(10, Duration::from_millis(1));
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let total_thread_count: usize = receiver_count as usize + sender_count as usize;
+        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(total_thread_count);
+
+        for _ in 0..receiver_count {
+            handles.push(counted_receiver(
+                receiver.clone(),
+                pair.clone(),
+                message_count,
+            ));
+        }
+
+        for _ in 0..sender_count {
+            handles.push(counted_sender(
+                sender.clone(),
+                pair.clone(),
+                message.clone(),
+                message_count,
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(10)); // gives threads time to start.
+        let (ref mutex, ref condvar) = &*pair;
+        let mut started = mutex.lock().unwrap();
+        *started = true;
+        condvar.notify_all();
+        drop(started);
+
+        let start = Instant::now();
+        while sender.sent() < message_count && receiver.received() < message_count {
+            if Instant::elapsed(&start) > time_limit {
+                panic!("Test took more than {:?} ms to run!", time_limit);
+            }
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    /// Tests channel under mutliple receivers and a single sender.
+    #[test]
+    fn test_multiple_receiver_single_sender() {
+        init_test_log();
+        multiple_thread_helper(2, 1, 10_000, Duration::from_millis(1000), 7 as u32);
+    }
+
+    #[test]
+    fn test_multiple_sender_single_receiver() {
+        init_test_log();
+        multiple_thread_helper(1, 3, 10_000, Duration::from_millis(1000), 7 as u32);
+    }
+
+    /// Tests channel under mutliple receivers and a single sender.
+    #[test]
+    fn test_multiple_receiver_multiple_sender() {
+        init_test_log();
+        multiple_thread_helper(3, 3, 10_000, Duration::from_millis(1000), 7 as u32);
+    }
+
 }
