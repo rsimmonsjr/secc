@@ -79,7 +79,7 @@
 //! around logically but not physically.
 //!
 
-use future::task::Waker;
+use futures::task::Waker;
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::future::Future;
