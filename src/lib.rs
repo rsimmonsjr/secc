@@ -708,6 +708,14 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
         Ok(())
     }
 
+    /// Creates a futures stream for receiving elements from the channel. The result of each
+    /// iteration is either an item from the channel or an error.
+    pub fn stream(&self) -> SeccReceiverStream<T> {
+        SeccReceiverStream {
+            receiver: self.clone(),
+        }
+    }
+
     /// A helper to call [`SeccReceiver::receive`] and await receivable messages until a message
     /// is aailable or the specified timeout has expired.
     pub fn receive_await_timeout(&self, timeout: Duration) -> Result<T, SeccErrors<T>> {
