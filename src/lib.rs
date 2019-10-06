@@ -79,10 +79,14 @@
 //! around logically but not physically.
 //!
 
+use future::task::Waker;
 use std::cell::UnsafeCell;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::task::Poll;
 use std::time::Duration;
 
 /// A message that is used to indicate that a position index points to no other node. Note that
@@ -234,16 +238,23 @@ pub struct SeccCore<T: Sync + Send + Clone> {
     poll_timeout: Duration,
     /// Storage of the nodes.
     nodes: Box<[SeccNode<T>]>,
-    /// Indexes in the `nodes` used for sending elements to the channel.  These pointers are
-    /// paired together with a [`std::sync::Condvar`] that allows receivers awaiting messages
-    /// to be notified that messages are available but this mutex should only be used by receivers
-    /// with a [`std::sync::Condvar`] to prevent deadlocking the channel.
-    send_ptrs: Arc<(Mutex<SeccSendPtrs>, Condvar)>,
-    /// Indexes in the `nodes` used for receiving elements from the channel. These pointers
-    /// are combined with a [`std::sync::Condvar`] that can be used by senders awaiting capacity
-    /// but the mutex should only be used by the senders with a [`std::sync::Condvar`] to avoid
+    /// Indexes in the `nodes` used for sending elements to the channel as well as other data
+    /// that assists futures and waiting. The second element of the tuple in the mutex is the
+    /// wakers that need to be called when messages are sent to the channel, indicating data is
+    /// available to be read. These pointers are paired together with a [`std::sync::Condvar`]
+    /// that allows receivers awaiting messages to be notified that messages are available but
+    /// this mutex should only be used by receivers with a [`std::sync::Condvar`] to prevent
     /// deadlocking the channel.
-    receive_ptrs: Arc<(Mutex<SeccReceivePtrs>, Condvar)>,
+    /// FIXME Investigate how to optimize sizing the vec.
+    send_ptrs: Arc<(Mutex<(SeccSendPtrs, Vec<Waker>)>, Condvar)>,
+    /// Indexes in the `nodes` used for receiving elements from the channel as well as other data
+    /// that assists futures and waiting. The second element of the tuple in the mutex is the
+    /// wakers that need to be called when space is available to be sent to the channel.  The
+    /// pointers are combined with a [`std::sync::Condvar`] that can be used by senders awaiting
+    /// capacity but the mutex should only be used by the senders with a [`std::sync::Condvar`]
+    /// to avoid deadlocking the channel.
+    /// FIXME Investigate how to optimize sizing the vec.
+    receive_ptrs: Arc<(Mutex<(SeccReceivePtrs, Vec<Waker>)>, Condvar)>,
     /// Count of the number of times receivers of this channel waited for messages.
     awaited_messages: AtomicUsize,
     /// Count of the number of times senders to the channel waited for capacity.
@@ -258,6 +269,45 @@ pub struct SeccCore<T: Sync + Send + Clone> {
     sent: AtomicUsize,
     /// Total number of messages that have been received from the channel.
     received: AtomicUsize,
+}
+
+/// The future type used when asynchrnously sending to the channel.
+pub struct SeccSendFuture<T: Sync + Send + Clone> {
+    sender: SeccSender<T>,
+    value: Option<T>,
+}
+
+impl<T: Sync + Send + Clone> SeccSendFuture<T> {
+    /// Creates a new future with the given value on the given sender. When this future is complete
+    /// then the value will have been sent to the channel or an unrecoverable error (not
+    /// `SeccErrors::Full` will be returned. It is important to note that the value will be moved
+    /// into the future and not returned to the creator.
+    fn new(value: T, sender: SeccSender<T>) -> SeccSendFuture<T> {
+        SeccSendFuture {
+            sender: sender,
+            value: Some(value),
+        }
+    }
+}
+
+impl<T: Sync + Send + Clone> Unpin for SeccSendFuture<T> {}
+
+impl<T: Sync + Send + Clone> Future for SeccSendFuture<T> {
+    type Output = Result<(), SeccErrors<T>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let value = self.value.take().unwrap();
+        match self.sender.send(value) {
+            result @ Ok(_) => Poll::Ready(result),
+            Err(SeccErrors::Full(returned_value)) => {
+                // Value is moved so the full will return it to us, we will store it back.
+                self.value = Some(returned_value);
+                self.sender.add_send_waker(cx.waker().clone());
+                Poll::Pending
+            }
+            error @ Err(_) => Poll::Ready(error),
+        }
+    }
 }
 
 /// Sender side of the channel.
@@ -277,10 +327,22 @@ impl<T: Sync + Send + Clone> Clone for SeccSender<T> {
 }
 
 impl<T: Sync + Send + Clone> SeccSender<T> {
+    /// Adds a waker to the list of wakers tracked by the channel for send operations. All wakers
+    /// will be called when the state of the channel changes allowing more data to be sent to the
+    /// channel. Note that this is currently a mad scramble since all wakers are notified when
+    /// space is available to send to the channel but this can be optimized later.
+    fn add_send_waker(&self, waker: Waker) {
+        let (ref mutex, _) = &*self.core.send_ptrs;
+        let mut guard = mutex.lock().unwrap();
+        let (_, ref mut wakers) = *guard;
+        wakers.push(waker);
+    }
+
     /// Creates a debug string for diagnosing problems with the send side of the channel. Note
     /// that this requires the user to pass the mutex lock because Rust mutex locks are not
     /// re-entrant so this cannot be done with a derive Debug.
-    fn debug_locked(&self, send_ptrs: &MutexGuard<SeccSendPtrs>) -> String {
+    fn debug_locked(&self, guard: &MutexGuard<(SeccSendPtrs, Vec<Waker>)>) -> String {
+        let (ref send_ptrs, _) = **guard;
         let mut pool = Vec::with_capacity(self.core.capacity);
         pool.push(send_ptrs.pool_head);
         let mut next_ptr = self.core.nodes[send_ptrs.pool_head]
@@ -304,8 +366,9 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
     /// sent if something went wrong.
     pub fn send(&self, message: T) -> Result<(), SeccErrors<T>> {
         // Retrieve send pointers and the encoded indexes inside them and their Condvar.
-        let (ref mutex, ref condvar) = &*self.core.send_ptrs;
-        let mut send_ptrs = mutex.lock().unwrap();
+        let (ref mutex, condvar) = &*self.core.send_ptrs;
+        let mut guard = mutex.lock().unwrap();
+        let (ref mut send_ptrs, ref mut wakers) = *guard;
 
         // Get a pointer to the current pool_head and see if we have space to send.
         let pool_head_ptr = &self.core.nodes[send_ptrs.pool_head];
@@ -338,10 +401,21 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
             // think this node is ready for receiving when it isn't until just now.
             queue_tail_ptr.next.store(old_pool_head, Ordering::SeqCst);
 
+            // Call and remove all wakers.
+            for waker in wakers.drain(..) {
+                waker.wake();
+            }
+
             // Notify anyone that was waiting on the Condvar and we are done.
             condvar.notify_all();
             Ok(())
         }
+    }
+
+    /// Returns a future for sending to the channel. The future will attempt to send to the channel
+    /// on each poll and will be awoken when space opens up in the channel.
+    pub fn async_send(&self, value: T) -> SeccSendFuture<T> {
+        SeccSendFuture::new(value, self.clone())
     }
 
     /// Send to the channel, awaiting capacity if necessary up to a given timeout. This
@@ -357,10 +431,11 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
                 Err(SeccErrors::Full(v)) => {
                     message = v;
                     // We will put a Condvar on the mutex to be notified if space opens up.
-                    let (ref mutex, ref condvar) = &*self.core.receive_ptrs;
-                    let receive_ptrs = mutex.lock().unwrap();
+                    let (ref mutex, condvar) = &*self.core.receive_ptrs;
+                    let guard = mutex.lock().unwrap();
+
                     // Important that we drop the Condvar's guard to not deadlock channel.
-                    let (_, result) = condvar.wait_timeout(receive_ptrs, timeout).unwrap();
+                    let (_, result) = condvar.wait_timeout(guard, timeout).unwrap();
                     self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
                     if result.timed_out() {
                         // Try one more time to send in case we missed a Condvar notification.
@@ -428,7 +503,8 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
     /// Creates a debug string for diagnosing problems with the receive side of the channel.
     /// This requires the user to pass the `MutexGuard` for the lock of the receive side of the
     /// channel because Rust `Mutex` locks are not re-entrant.
-    fn debug_locked(&self, receive_ptrs: &MutexGuard<SeccReceivePtrs>) -> String {
+    fn debug_locked(&self, guard: &MutexGuard<(SeccReceivePtrs, Vec<Waker>)>) -> String {
+        let (ref receive_ptrs, _) = **guard;
         let mut queue = Vec::with_capacity(self.core.capacity);
         let mut next_ptr = self.core.nodes[receive_ptrs.queue_head]
             .next
@@ -454,7 +530,8 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
     pub fn peek(&self) -> Result<T, SeccErrors<T>> {
         // Retrieve receive pointers and the encoded indexes inside them.
         let (ref mutex, _) = &*self.core.receive_ptrs;
-        let receive_ptrs = mutex.lock().unwrap();
+        let mut guard = mutex.lock().unwrap();
+        let (ref mut receive_ptrs, _) = *guard;
 
         // Get a pointer to the queue_head or cursor and see check for anything receivable.
         let read_ptr = if receive_ptrs.cursor == NIL {
@@ -484,8 +561,9 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
     /// messages in the channel because there will be none readable until the skip is reset.
     pub fn receive(&self) -> Result<T, SeccErrors<T>> {
         // Retrieve receive pointers and the encoded indexes inside them.
-        let (ref mutex, ref condvar) = &*self.core.receive_ptrs;
-        let mut receive_ptrs = mutex.lock().unwrap();
+        let (ref mutex, condvar) = &*self.core.receive_ptrs;
+        let mut guard = mutex.lock().unwrap();
+        let (ref mut receive_ptrs, ref mut wakers) = *guard;
 
         // Get a pointer to the queue_head or cursor and see check for anything receivable.
         let read_ptr = if receive_ptrs.cursor == NIL {
@@ -537,6 +615,11 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
             // is available for sending when it actually isn't until just now.
             (*pool_tail_ptr).next.store(new_pool_tail, Ordering::SeqCst);
 
+            // Call and remove all wakers.
+            for waker in wakers.drain(..) {
+                waker.wake();
+            }
+
             // Notify anyone waiting on messages to be available.
             condvar.notify_all();
 
@@ -558,9 +641,9 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
         loop {
             match self.receive() {
                 Err(SeccErrors::Empty) => {
-                    let (ref mutex, ref condvar) = &*self.core.send_ptrs;
-                    let send_ptrs = mutex.lock().unwrap();
-                    let (_, result) = condvar.wait_timeout(send_ptrs, timeout).unwrap();
+                    let (ref mutex, condvar) = &*self.core.send_ptrs;
+                    let guard = mutex.lock().unwrap();
+                    let (_, result) = condvar.wait_timeout(guard, timeout).unwrap();
                     self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
                     if result.timed_out() {
                         // Try one more time in case we missed a Condvar notification.
@@ -591,7 +674,8 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
     pub fn skip(&self) -> Result<(), SeccErrors<T>> {
         // Retrieve receive pointers and the encoded indexes inside them.
         let (ref mutex, _) = &*self.core.receive_ptrs;
-        let mut receive_ptrs = mutex.lock().unwrap();
+        let mut guard = mutex.lock().unwrap();
+        let (ref mut receive_ptrs, _) = *guard;
 
         let read_ptr = if receive_ptrs.cursor == NIL {
             &self.core.nodes[receive_ptrs.queue_head]
@@ -623,8 +707,9 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
     /// method on a channel with no skip cursor will do nothing.
     pub fn reset_skip(&self) -> Result<(), SeccErrors<T>> {
         // Retrieve receive pointers and the encoded indexes inside them.
-        let (ref mutex, ref condvar) = &*self.core.receive_ptrs;
-        let mut receive_ptrs = mutex.lock().unwrap();
+        let (ref mutex, condvar) = &*self.core.receive_ptrs;
+        let mut guard = mutex.lock().unwrap();
+        let (ref mut receive_ptrs, _) = *guard;
 
         if receive_ptrs.cursor != NIL {
             // We start from queue head and count to the cursor to get the new number of currently
@@ -735,8 +820,10 @@ pub fn create<T: Sync + Send + Clone>(
         capacity: capacity as usize,
         poll_timeout,
         nodes: nodes.into_boxed_slice(),
-        send_ptrs: Arc::new((Mutex::new(send_ptrs), Condvar::new())),
-        receive_ptrs: Arc::new((Mutex::new(receive_ptrs), Condvar::new())),
+        // FIXME create a sane default for vec size or let user configure.
+        send_ptrs: Arc::new((Mutex::new((send_ptrs, Vec::new())), Condvar::new())),
+        // FIXME create a sane default for vec size or let user configure.
+        receive_ptrs: Arc::new((Mutex::new((receive_ptrs, Vec::new())), Condvar::new())),
         awaited_messages: AtomicUsize::new(0),
         awaited_capacity: AtomicUsize::new(0),
         pending: AtomicUsize::new(0),
@@ -775,9 +862,12 @@ mod tests {
         ) => {{
             let actual = debug_channel($sender.clone(), $receiver.clone());
             let (ref mutex, _) = &*$sender.core.send_ptrs;
-            let send_ptrs = mutex.lock().unwrap();
+            let mut send_guard = mutex.lock().unwrap();
+            let (ref mut send_ptrs, _) = *send_guard;
+
             let (ref mutex, _) = &*$receiver.core.receive_ptrs;
-            let receive_ptrs = mutex.lock().unwrap();
+            let mut receive_guard = mutex.lock().unwrap();
+            let (ref mut receive_ptrs, _) = *receive_guard;
 
             assert_eq!(
                 $queue_head, receive_ptrs.queue_head,
@@ -1609,5 +1699,4 @@ mod tests {
     fn test_multiple_receiver_multiple_sender() {
         multiple_thread_helper(3, 3, 10_000, Duration::from_millis(1000), 7 as u32);
     }
-
 }

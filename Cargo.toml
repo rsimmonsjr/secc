@@ -41,3 +41,5 @@ maintenance = { status = "actively-developed" }
 [dev-dependencies]
 
 [dependencies]
+futures-preview = { version = "0.3.0-alpha.19", features = ["async-await"] }
+
