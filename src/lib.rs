@@ -79,6 +79,7 @@
 //! around logically but not physically.
 //!
 
+use futures::stream::Stream;
 use futures::task::Waker;
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -86,6 +87,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -100,17 +102,27 @@ pub enum SeccErrors<T: Sync + Send + Clone> {
     /// message attempted to be sent.
     Full(T),
 
+    /// There are no more possible receivers to the channel so sending data would be pointless.
+    /// The element of the tuple is the message that was to be sent.
+    NoReceivers(T),
+
     /// Channel is empty so no more messages can be received. This can also be returned if there
     /// is an active cursor and there are no messages to receive after the cursor even though
     /// there are skipped messages.
     Empty,
+
+    /// Channel is empty and there is no chance of any other process sending to the channel
+    /// since no one is holding the sender anymore.
+    EmptyNoSenders,
 }
 
 impl<T: Sync + Send + Clone> fmt::Debug for SeccErrors<T> {
     fn fmt(&self, formatter: &'_ mut fmt::Formatter) -> fmt::Result {
         match self {
             SeccErrors::Full(_) => write!(formatter, "SeccErrors::Full"),
+            SeccErrors::NoReceivers(_) => write!(formatter, "SeccErrors::NoReceivers"),
             SeccErrors::Empty => write!(formatter, "SeccErrors::Empty"),
+            SeccErrors::EmptyNoSenders => write!(formatter, "SeccErrors::EmptyNoSenders"),
         }
     }
 }
@@ -295,7 +307,7 @@ impl<T: Sync + Send + Clone> Unpin for SeccSendFuture<T> {}
 impl<T: Sync + Send + Clone> Future for SeccSendFuture<T> {
     type Output = Result<(), SeccErrors<T>>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let value = self.value.take().unwrap();
         match self.sender.send(value) {
             result @ Ok(_) => Poll::Ready(result),
@@ -365,6 +377,13 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
     /// an empty [`std::Result::Ok`] or an [`std::Result::Err`] containing the last message
     /// sent if something went wrong.
     pub fn send(&self, message: T) -> Result<(), SeccErrors<T>> {
+        // Check to see if anyone can receive from the channel. If this sender is the only thing
+        // holding the core then the receiver is held by no one.
+        // FIXME Needs testing
+        if Arc::strong_count(&self.core) < 2 {
+            return Err(SeccErrors::NoReceivers(message));
+        }
+
         // Retrieve send pointers and the encoded indexes inside them and their Condvar.
         let (ref mutex, condvar) = &*self.core.send_ptrs;
         let mut guard = mutex.lock().unwrap();
@@ -483,6 +502,32 @@ unsafe impl<T: Send + Sync + Clone> Send for SeccSender<T> {}
 
 unsafe impl<T: Send + Sync + Clone> Sync for SeccSender<T> {}
 
+/// A stream that receives messages from the channel as they become available.
+pub struct SeccReceiverStream<T: Send + Sync + Clone> {
+    /// This is the receiver that this stream will use for items comming off of the channel.
+    receiver: SeccReceiver<T>,
+}
+
+impl<T: Send + Sync + Clone> Stream for SeccReceiverStream<T> {
+    // FIXME Separate SeccErrors into two enums.
+    type Item = Result<T, SeccErrors<T>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // FIXME When the SeccSender is dropped by all others then the stream should return none.
+        // FIXME When an error occurrs that isnt just empty set up stream to do a none on next
+        // poll.
+        match self.receiver.receive() {
+            result @ Ok(_) => Poll::Ready(Some(result)),
+            Err(SeccErrors::Empty) => {
+                self.receiver.add_receive_waker(cx.waker().clone());
+                Poll::Pending
+            }
+            error @ Err(SeccErrors::EmptyNoSenders) => Poll::Ready(Some(error)),
+            error @ Err(_) => Poll::Ready(Some(error)),
+        }
+    }
+}
+
 /// Receiver side of the channel.
 pub struct SeccReceiver<T: Sync + Send + Clone> {
     /// The core of the channel.
@@ -523,6 +568,19 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
         )
     }
 
+    /// Adds a waker to the list of wakers tracked by the channel for receive operations. All
+    /// wakers will be called when the state of the channel changes allowing more data to be sent
+    /// to the channel. Note that this is currently a mad scramble since all wakers are notified
+    /// when messages are available to receive from to the channel.
+    ///
+    /// FIXME Should we optimize waking to not wake more than one future?
+    fn add_receive_waker(&self, waker: Waker) {
+        let (ref mutex, _) = &*self.core.receive_ptrs;
+        let mut guard = mutex.lock().unwrap();
+        let (_, ref mut wakers) = *guard;
+        wakers.push(waker);
+    }
+
     /// Peeks at the next receivable message in the channel and returns a `Clone` of the message.
     /// Note that the message isn't guaranteed to stay in the channel as a thread could pop the
     /// message off while another thread is looking at the value but the value shouldn't change
@@ -541,7 +599,14 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
         };
         let next_read_pos = (*read_ptr).next.load(Ordering::SeqCst);
         if NIL == next_read_pos {
-            return Err(SeccErrors::Empty);
+            // Check to see if anyone can receive from the channel. If this receiver is the
+            // only thing holding the core then the receiver is held by no one.
+            // FIXME Needs testing
+            if Arc::strong_count(&self.core) < 2 {
+                return Err(SeccErrors::EmptyNoSenders);
+            } else {
+                return Err(SeccErrors::Empty);
+            }
         }
 
         // Extract the message and return a reference to it. If this panics then there
@@ -573,7 +638,15 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
         };
         let next_read_pos = (*read_ptr).next.load(Ordering::SeqCst);
         if NIL == next_read_pos {
-            Err(SeccErrors::Empty)
+            // Check to see if anyone can receive from the channel. If this receiver is the
+            // only thing holding the core then the sender is held by no one and no more messages
+            // can be received.
+            // FIXME Needs testing
+            if Arc::strong_count(&self.core) < 2 {
+                return Err(SeccErrors::EmptyNoSenders);
+            } else {
+                return Err(SeccErrors::Empty);
+            }
         } else {
             // We can read something so we will pull the item out of the read pointer.
             let message: T = unsafe { (*(*read_ptr).cell.get()).take().unwrap() };
