@@ -1780,4 +1780,50 @@ mod tests {
     fn test_multiple_receiver_multiple_sender() {
         multiple_thread_helper(3, 3, 10_000, Duration::from_millis(1000), 7 as u32);
     }
+
+    #[test]
+    fn test_async_send_to_empty_channel() {
+        use futures::executor::block_on;
+        let (sender, receiver) = create::<i32>(1, Duration::from_millis(1));
+
+        // Sending to an empty channel should work.
+        block_on(sender.async_send(17)).unwrap();
+        thread::sleep(Duration::from_millis(2));
+
+        let handle = thread::spawn(move || {
+            match receiver.receive_await_timeout(Duration::from_millis(10)) {
+                Ok(_) => (),
+                Err(e) => panic!("Receive returned: {}", e),
+            }
+        });
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_async_send_to_full_channel() {
+        use futures::executor::block_on;
+        let (sender, receiver) = create::<i32>(1, Duration::from_millis(1));
+
+        let handle = thread::spawn(move || {
+            println!("receiving first");
+            match receiver.receive_await_timeout(Duration::from_millis(10)) {
+                Ok(_) => (),
+                Err(e) => panic!("Receive returned: {}", e),
+            }
+            println!("receiving second");
+            // Receive the second message sent by future.
+            match receiver.receive_await_timeout(Duration::from_millis(10)) {
+                Ok(_) => (),
+                Err(e) => panic!("Receive returned: {}", e),
+            }
+        });
+
+        sender.send(5).unwrap();
+
+        // Sending to a full channel should work after first message is received.
+        block_on(sender.async_send(17)).unwrap();
+
+        handle.join().unwrap();
+    }
 }
