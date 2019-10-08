@@ -86,7 +86,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
@@ -209,22 +209,59 @@ pub trait SeccCoreOps<T: Sync + Send + Clone> {
     fn received(&self) -> usize {
         self.core().received.load(Ordering::Relaxed)
     }
+
+    /// Creates a debug string for diagnosing problems with the send side of the channel.
+    fn debug_structure(&self) -> String {
+        let (ref mutex, _, _) = &*self.core().lock;
+        let pointers = mutex.lock().unwrap();
+
+        let mut pool = Vec::with_capacity(self.core().capacity);
+        pool.push(pointers.pool_head);
+        let mut next_ptr = self.core().nodes[pointers.pool_head]
+            .next
+            .load(Ordering::SeqCst);
+        while next_ptr != NIL {
+            pool.push(next_ptr);
+            next_ptr = self.core().nodes[next_ptr].next.load(Ordering::SeqCst);
+        }
+
+        let mut queue = Vec::with_capacity(self.core().capacity);
+        let mut next_ptr = self.core().nodes[pointers.queue_head]
+            .next
+            .load(Ordering::SeqCst);
+        queue.push(pointers.queue_head);
+        while next_ptr != NIL {
+            queue.push(next_ptr);
+            next_ptr = self.core().nodes[next_ptr].next.load(Ordering::SeqCst);
+        }
+
+        format!(
+            "queue_head: {}, queue_tail: {}, pool_head: {}, pool_tail: {}, skipped: {}, 
+                cursor: {}, queue_size: {}, queue: {:?}, pool_size: {}, pool: {:?}",
+            pointers.queue_head,
+            pointers.queue_tail,
+            pointers.pool_head,
+            pointers.pool_tail,
+            pointers.skipped,
+            pointers.cursor,
+            queue.len(),
+            queue,
+            pool.len(),
+            pool
+        )
+    }
 }
 
-/// A structure containing the pointers used when sending items to the channel.
-#[derive(Debug)]
-struct SeccSendPtrs {
+/// A struct holding the pointers and other mutable data in the channel that will live inside the
+/// channel's mutex to provide interior mutability. Operations on this data are designed to be as
+/// minimal as possible to reduce contention on the mutex.
+struct SeccPointers {
     /// The tail of the queue which holds messages currently in the channel.
     queue_tail: usize,
     /// The head of the pool of available nodes to be used when sending messages to the channel.  
     /// Note that if there is only one node in the pool then the channel is full as neither the
     /// pool nor queue may be empty.
     pool_head: usize,
-}
-
-/// A structure containing pointers used when receiving messages from the channel.
-#[derive(Debug)]
-struct SeccReceivePtrs {
     /// The head of the queue which holds messages currently in the channel.  Note that if there
     /// is only one node in the queue then the channel is empty as neither the pool nor queue
     /// may be empty.
@@ -237,6 +274,10 @@ struct SeccReceivePtrs {
     /// Either `NIL`, when there is no current skip cursor, or a pointer to the next
     /// element that can be received from the channel.
     cursor: usize,
+    /// The wakers that are registered waiting on capacity if any.
+    send_wakers: Option<Vec<Waker>>,
+    /// The wakers that are registered waiting on data if any.
+    receive_wakers: Option<Vec<Waker>>,
 }
 
 /// Data structure that contains the core of the channel including tracking of statistics and
@@ -250,23 +291,9 @@ pub struct SeccCore<T: Sync + Send + Clone> {
     poll_timeout: Duration,
     /// Storage of the nodes.
     nodes: Box<[SeccNode<T>]>,
-    /// Indexes in the `nodes` used for sending elements to the channel as well as other data
-    /// that assists futures and waiting. The second element of the tuple in the mutex is the
-    /// wakers that need to be called when messages are sent to the channel, indicating data is
-    /// available to be read. These pointers are paired together with a [`std::sync::Condvar`]
-    /// that allows receivers awaiting messages to be notified that messages are available but
-    /// this mutex should only be used by receivers with a [`std::sync::Condvar`] to prevent
-    /// deadlocking the channel.
-    /// FIXME Investigate how to optimize sizing the vec.
-    send_ptrs: Arc<(Mutex<(SeccSendPtrs, Vec<Waker>)>, Condvar)>,
-    /// Indexes in the `nodes` used for receiving elements from the channel as well as other data
-    /// that assists futures and waiting. The second element of the tuple in the mutex is the
-    /// wakers that need to be called when space is available to be sent to the channel.  The
-    /// pointers are combined with a [`std::sync::Condvar`] that can be used by senders awaiting
-    /// capacity but the mutex should only be used by the senders with a [`std::sync::Condvar`]
-    /// to avoid deadlocking the channel.
-    /// FIXME Investigate how to optimize sizing the vec.
-    receive_ptrs: Arc<(Mutex<(SeccReceivePtrs, Vec<Waker>)>, Condvar)>,
+    /// This is the lock that is used for channel operations as well as condvars for both
+    /// has_capacity and has_data respectively, that will be used to signal changes in the channel.
+    lock: Arc<(Mutex<SeccPointers>, Condvar, Condvar)>,
     /// Count of the number of times receivers of this channel waited for messages.
     awaited_messages: AtomicUsize,
     /// Count of the number of times senders to the channel waited for capacity.
@@ -308,13 +335,14 @@ impl<T: Sync + Send + Clone> Future for SeccSendFuture<T> {
     type Output = Result<(), SeccErrors<T>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        println!("====> POLLING FUTURE");
         let value = self.value.take().unwrap();
-        match self.sender.send(value) {
+        match self.sender.send_internal(value, Some(cx.waker().clone())) {
             result @ Ok(_) => Poll::Ready(result),
             Err(SeccErrors::Full(returned_value)) => {
+                println!("====> CHANNEL FULL");
                 // Value is moved so the full will return it to us, we will store it back.
                 self.value = Some(returned_value);
-                self.sender.add_send_waker(cx.waker().clone());
                 Poll::Pending
             }
             error @ Err(_) => Poll::Ready(error),
@@ -339,44 +367,17 @@ impl<T: Sync + Send + Clone> Clone for SeccSender<T> {
 }
 
 impl<T: Sync + Send + Clone> SeccSender<T> {
-    /// Adds a waker to the list of wakers tracked by the channel for send operations. All wakers
-    /// will be called when the state of the channel changes allowing more data to be sent to the
-    /// channel. Note that this is currently a mad scramble since all wakers are notified when
-    /// space is available to send to the channel but this can be optimized later.
-    fn add_send_waker(&self, waker: Waker) {
-        let (ref mutex, _) = &*self.core.send_ptrs;
-        let mut guard = mutex.lock().unwrap();
-        let (_, ref mut wakers) = *guard;
-        wakers.push(waker);
-    }
-
-    /// Creates a debug string for diagnosing problems with the send side of the channel. Note
-    /// that this requires the user to pass the mutex lock because Rust mutex locks are not
-    /// re-entrant so this cannot be done with a derive Debug.
-    fn debug_locked(&self, guard: &MutexGuard<(SeccSendPtrs, Vec<Waker>)>) -> String {
-        let (ref send_ptrs, _) = **guard;
-        let mut pool = Vec::with_capacity(self.core.capacity);
-        pool.push(send_ptrs.pool_head);
-        let mut next_ptr = self.core.nodes[send_ptrs.pool_head]
-            .next
-            .load(Ordering::SeqCst);
-        let mut count = 1;
-        while next_ptr != NIL {
-            count += 1;
-            pool.push(next_ptr);
-            next_ptr = self.core.nodes[next_ptr].next.load(Ordering::SeqCst);
-        }
-
-        format!(
-            "send_ptrs: {:?}, pool_size: {}, pool: {:?}",
-            send_ptrs, count, pool
-        )
-    }
-
     /// Sends a message, which will be moved into the channel. This function will either return
     /// an empty [`std::Result::Ok`] or an [`std::Result::Err`] containing the last message
     /// sent if something went wrong.
     pub fn send(&self, message: T) -> Result<(), SeccErrors<T>> {
+        self.send_internal(message, None)
+    }
+
+    /// Internal implementation of send which will send a message to the channel if there is
+    /// space available in the channel. This implementation takes an optional waker which will
+    /// be registered if the channel is full.
+    fn send_internal(&self, message: T, waker: Option<Waker>) -> Result<(), SeccErrors<T>> {
         // Check to see if anyone can receive from the channel. If this sender is the only thing
         // holding the core then the receiver is held by no one.
         // FIXME Needs testing
@@ -384,19 +385,26 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
             return Err(SeccErrors::NoReceivers(message));
         }
 
-        // Retrieve send pointers and the encoded indexes inside them and their Condvar.
-        let (ref mutex, condvar) = &*self.core.send_ptrs;
-        let mut guard = mutex.lock().unwrap();
-        let (ref mut send_ptrs, ref mut wakers) = *guard;
+        // Lock the channel to operate on it.
+        let (ref mutex, _, has_data) = &*self.core.lock;
+        let mut pointers = mutex.lock().unwrap();
 
         // Get a pointer to the current pool_head and see if we have space to send.
-        let pool_head_ptr = &self.core.nodes[send_ptrs.pool_head];
+        let pool_head_ptr = &self.core.nodes[pointers.pool_head];
         let next_pool_head = pool_head_ptr.next.load(Ordering::SeqCst);
         if NIL == next_pool_head {
+            println!("Registering send waker");
+            if let Some(w) = waker {
+                if let Some(ref mut wakers) = pointers.send_wakers {
+                    wakers.push(w);
+                } else {
+                    pointers.send_wakers = Some(vec![w]);
+                }
+            }
             Err(SeccErrors::Full(message))
         } else {
             // We get the queue tail because the node from the pool will move here.
-            let queue_tail_ptr = &self.core.nodes[send_ptrs.queue_tail];
+            let queue_tail_ptr = &self.core.nodes[pointers.queue_tail];
 
             // Add the message to the node, transferring ownership.
             unsafe {
@@ -404,29 +412,39 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
             }
 
             // Update the pointers in the mutex.
-            let old_pool_head = send_ptrs.pool_head;
-            send_ptrs.queue_tail = send_ptrs.pool_head;
-            send_ptrs.pool_head = next_pool_head;
-
-            // Adjust the channel metrics.
-            self.core.sent.fetch_add(1, Ordering::SeqCst);
-            self.core.receivable.fetch_add(1, Ordering::SeqCst);
-            self.core.pending.fetch_add(1, Ordering::SeqCst);
+            let old_pool_head = pointers.pool_head;
+            pointers.queue_tail = pointers.pool_head;
+            pointers.pool_head = next_pool_head;
 
             // The now filled node will get moved to the queue.
             pool_head_ptr.next.store(NIL, Ordering::SeqCst);
-
-            // We MUST set this LAST or we will get into a race with the receiver that would
-            // think this node is ready for receiving when it isn't until just now.
             queue_tail_ptr.next.store(old_pool_head, Ordering::SeqCst);
 
-            // Call and remove all wakers.
-            for waker in wakers.drain(..) {
-                waker.wake();
-            }
+            // Take the receive wakers if any for iteration outside of the guard.
+            let wakers_opt = pointers.receive_wakers.take();
 
             // Notify anyone that was waiting on the Condvar and we are done.
-            condvar.notify_all();
+            has_data.notify_all();
+
+            // Adjust receivable count.
+            self.core.receivable.fetch_add(1, Ordering::SeqCst);
+
+            // End of critical block so drop the lock.
+            drop(pointers);
+
+            // Adjust the channel metrics.
+            self.core.sent.fetch_add(1, Ordering::SeqCst);
+            self.core.pending.fetch_add(1, Ordering::SeqCst);
+
+            // Call any potential wakers.
+            if let Some(mut wakers) = wakers_opt {
+                println!("====> receive wakers: {}", wakers.len());
+                for waker in wakers.drain(..) {
+                    println!("====> calling receive waker");
+                    waker.wake();
+                }
+            }
+
             Ok(())
         }
     }
@@ -434,6 +452,7 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
     /// Returns a future for sending to the channel. The future will attempt to send to the channel
     /// on each poll and will be awoken when space opens up in the channel.
     pub fn async_send(&self, value: T) -> SeccSendFuture<T> {
+        println!("====> CREATING FUTURE");
         SeccSendFuture::new(value, self.clone())
     }
 
@@ -450,11 +469,11 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
                 Err(SeccErrors::Full(v)) => {
                     message = v;
                     // We will put a Condvar on the mutex to be notified if space opens up.
-                    let (ref mutex, condvar) = &*self.core.receive_ptrs;
+                    let (ref mutex, has_capacity, _) = &*self.core.lock;
                     let guard = mutex.lock().unwrap();
 
                     // Important that we drop the Condvar's guard to not deadlock channel.
-                    let (_, result) = condvar.wait_timeout(guard, timeout).unwrap();
+                    let (_, result) = has_capacity.wait_timeout(guard, timeout).unwrap();
                     self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
                     if result.timed_out() {
                         // Try one more time to send in case we missed a Condvar notification.
@@ -486,15 +505,10 @@ impl<T: Sync + Send + Clone> SeccCoreOps<T> for SeccSender<T> {
     }
 }
 
-/// This function will write a debug string for the `SeccSender` but be warned that it will
-/// acquire the mutex lock to the `send_ptrs` to accomplish this so a deadlock could ensue if
-/// you have two threads asking for debug on both `SeccSender` and `SeccReceiver`, especially
-/// if they are doing so in a different order.
+/// This function will write a debug string for the `SeccSender`.
 impl<T: Sync + Send + Clone> fmt::Debug for SeccSender<T> {
     fn fmt(&self, formatter: &'_ mut fmt::Formatter) -> fmt::Result {
-        let (ref mutex, _) = &*self.core.send_ptrs;
-        let send_ptrs = mutex.lock().unwrap();
-        write!(formatter, "{}", self.debug_locked(&send_ptrs))
+        write!(formatter, "{}", self.debug_structure())
     }
 }
 
@@ -513,15 +527,9 @@ impl<T: Send + Sync + Clone> Stream for SeccReceiverStream<T> {
     type Item = Result<T, SeccErrors<T>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // FIXME When the SeccSender is dropped by all others then the stream should return none.
-        // FIXME When an error occurrs that isnt just empty set up stream to do a none on next
-        // poll.
-        match self.receiver.receive() {
+        match self.receiver.receive_internal(Some(cx.waker().clone())) {
             result @ Ok(_) => Poll::Ready(Some(result)),
-            Err(SeccErrors::Empty) => {
-                self.receiver.add_receive_waker(cx.waker().clone());
-                Poll::Pending
-            }
+            Err(SeccErrors::Empty) => Poll::Pending,
             error @ Err(SeccErrors::EmptyNoSenders) => Poll::Ready(Some(error)),
             error @ Err(_) => Poll::Ready(Some(error)),
         }
@@ -545,40 +553,102 @@ impl<T: Sync + Send + Clone> Clone for SeccReceiver<T> {
 }
 
 impl<T: Sync + Send + Clone> SeccReceiver<T> {
-    /// Creates a debug string for diagnosing problems with the receive side of the channel.
-    /// This requires the user to pass the `MutexGuard` for the lock of the receive side of the
-    /// channel because Rust `Mutex` locks are not re-entrant.
-    fn debug_locked(&self, guard: &MutexGuard<(SeccReceivePtrs, Vec<Waker>)>) -> String {
-        let (ref receive_ptrs, _) = **guard;
-        let mut queue = Vec::with_capacity(self.core.capacity);
-        let mut next_ptr = self.core.nodes[receive_ptrs.queue_head]
-            .next
-            .load(Ordering::SeqCst);
-        queue.push(receive_ptrs.queue_head);
-        let mut count = 1;
-        while next_ptr != NIL {
-            count += 1;
-            queue.push(next_ptr);
-            next_ptr = self.core.nodes[next_ptr].next.load(Ordering::SeqCst);
-        }
-
-        format!(
-            "receive_ptrs: {:?}, queue_size: {}, queue: {:?}",
-            receive_ptrs, count, queue
-        )
+    /// Receives the next message that is receivable. This will either receive the message at
+    /// the head of the channel or, in the case that there is a skip cursor active, the next
+    /// receivable message will be in the node pointed to by the skip cursor. This means that it
+    /// is possible that receive could return an [`SeccErrors::Empty`] when there are actually
+    /// messages in the channel because there will be none readable until the skip is reset.
+    pub fn receive(&self) -> Result<T, SeccErrors<T>> {
+        self.receive_internal(None)
     }
 
-    /// Adds a waker to the list of wakers tracked by the channel for receive operations. All
-    /// wakers will be called when the state of the channel changes allowing more data to be sent
-    /// to the channel. Note that this is currently a mad scramble since all wakers are notified
-    /// when messages are available to receive from to the channel.
-    ///
-    /// FIXME Should we optimize waking to not wake more than one future?
-    fn add_receive_waker(&self, waker: Waker) {
-        let (ref mutex, _) = &*self.core.receive_ptrs;
-        let mut guard = mutex.lock().unwrap();
-        let (_, ref mut wakers) = *guard;
-        wakers.push(waker);
+    /// Internal function for receiving which will take an optional waker to be registered if there
+    /// is no data currently to receive.
+    pub fn receive_internal(&self, waker: Option<Waker>) -> Result<T, SeccErrors<T>> {
+        let (ref mutex, has_capacity, _) = &*self.core.lock;
+        let mut pointers = mutex.lock().unwrap();
+
+        // Get a pointer to the queue_head or cursor and see check for anything receivable.
+        let read_ptr = if pointers.cursor == NIL {
+            &self.core.nodes[pointers.queue_head]
+        } else {
+            &self.core.nodes[pointers.cursor]
+        };
+        let next_read_pos = (*read_ptr).next.load(Ordering::SeqCst);
+        if NIL == next_read_pos {
+            // Check to see if anyone can receive from the channel. If this receiver is the only
+            // thing holding the core then the sender is held by no one and no more messages can
+            // enter the channel so we will only receive if there are pending messages.
+            // FIXME Needs testing
+            if Arc::strong_count(&self.core) < 2 {
+                return Err(SeccErrors::EmptyNoSenders);
+            } else {
+                if let Some(w) = waker {
+                    if let Some(ref mut wakers) = pointers.receive_wakers {
+                        wakers.push(w);
+                    } else {
+                        pointers.receive_wakers = Some(vec![w]);
+                    }
+                }
+                return Err(SeccErrors::Empty);
+            }
+        } else {
+            // We can read something so we will pull the item out of the read pointer.
+            let message: T = unsafe { (*(*read_ptr).cell.get()).take().unwrap() };
+
+            // Now we have to manage either pulling a node out of the middle if there was a
+            // cursor, or from the queue head if there was no cursor. Then we have to place
+            // the released node on the pool tail.
+            let pool_tail_ptr = &self.core.nodes[pointers.pool_tail];
+            (*read_ptr).next.store(NIL, Ordering::SeqCst);
+
+            let new_pool_tail = if pointers.cursor == NIL {
+                // If we aren't using a cursor then the queue_head becomes the pool tail
+                pointers.pool_tail = pointers.queue_head;
+                let old_queue_head = pointers.queue_head;
+                pointers.queue_head = next_read_pos;
+                old_queue_head
+            } else {
+                // If the cursor is set we have to dequeue in the middle of the list and fix the
+                // node chain and then move the node that the cursor was pointing at to the pool
+                // tail. Note that the `skipped` pointer will never be `NIL` when the cursor is
+                // not `NIL`. The `skipped` pointer is only ever set to a skipped node that
+                // could be read and lags beind `cursor` by one node in the queue.
+                let skipped_ptr = &self.core.nodes[pointers.skipped];
+                ((*skipped_ptr).next).store(next_read_pos, Ordering::SeqCst);
+                (*read_ptr).next.store(NIL, Ordering::SeqCst);
+                pointers.pool_tail = pointers.cursor;
+                let old_cursor = pointers.cursor;
+                pointers.cursor = next_read_pos;
+                old_cursor
+            };
+
+            (*pool_tail_ptr).next.store(new_pool_tail, Ordering::SeqCst);
+            self.core.receivable.fetch_sub(1, Ordering::SeqCst);
+            let wakers_opt = pointers.send_wakers.take();
+
+            // End of critical block so drop the lock.
+            drop(pointers);
+
+            // Update the channel metrics.
+            self.core.received.fetch_add(1, Ordering::SeqCst);
+            self.core.pending.fetch_sub(1, Ordering::SeqCst);
+
+            // Call and remove all wakers.
+            if let Some(mut wakers) = wakers_opt {
+                println!("====> send wakers count {}", wakers.len());
+                for waker in wakers.drain(..) {
+                    println!("====> calling send waker");
+                    waker.wake();
+                }
+            }
+
+            // Notify anyone waiting on messages to be available.
+            has_capacity.notify_all();
+
+            // Return the message retreived earlier.
+            Ok(message)
+        }
     }
 
     /// Peeks at the next receivable message in the channel and returns a `Clone` of the message.
@@ -586,25 +656,33 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
     /// message off while another thread is looking at the value but the value shouldn't change
     /// under the peeking thread.
     pub fn peek(&self) -> Result<T, SeccErrors<T>> {
-        // Retrieve receive pointers and the encoded indexes inside them.
-        let (ref mutex, _) = &*self.core.receive_ptrs;
-        let mut guard = mutex.lock().unwrap();
-        let (ref mut receive_ptrs, _) = *guard;
+        self.peek_internal(None)
+    }
+
+    /// An internal function that implements peeking at the queue head and registers an optional
+    /// waker to be awoken if there is no data to be peeked at.
+    fn peek_internal(&self, waker: Option<Waker>) -> Result<T, SeccErrors<T>> {
+        let (ref mutex, _, _) = &*self.core.lock;
+        let mut pointers = mutex.lock().unwrap();
 
         // Get a pointer to the queue_head or cursor and see check for anything receivable.
-        let read_ptr = if receive_ptrs.cursor == NIL {
-            &self.core.nodes[receive_ptrs.queue_head]
+        let read_ptr = if pointers.cursor == NIL {
+            &self.core.nodes[pointers.queue_head]
         } else {
-            &self.core.nodes[receive_ptrs.cursor]
+            &self.core.nodes[pointers.cursor]
         };
         let next_read_pos = (*read_ptr).next.load(Ordering::SeqCst);
         if NIL == next_read_pos {
-            // Check to see if anyone can receive from the channel. If this receiver is the
-            // only thing holding the core then the receiver is held by no one.
-            // FIXME Needs testing
             if Arc::strong_count(&self.core) < 2 {
                 return Err(SeccErrors::EmptyNoSenders);
             } else {
+                if let Some(w) = waker {
+                    if let Some(ref mut wakers) = pointers.receive_wakers {
+                        wakers.push(w);
+                    } else {
+                        pointers.receive_wakers = Some(vec![w]);
+                    }
+                }
                 return Err(SeccErrors::Empty);
             }
         }
@@ -619,88 +697,6 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
         Ok(message)
     }
 
-    /// Receives the next message that is receivable. This will either receive the message at
-    /// the head of the channel or, in the case that there is a skip cursor active, the next
-    /// receivable message will be in the node pointed to by the skip cursor. This means that it
-    /// is possible that receive could return an [`SeccErrors::Empty`] when there are actually
-    /// messages in the channel because there will be none readable until the skip is reset.
-    pub fn receive(&self) -> Result<T, SeccErrors<T>> {
-        // Retrieve receive pointers and the encoded indexes inside them.
-        let (ref mutex, condvar) = &*self.core.receive_ptrs;
-        let mut guard = mutex.lock().unwrap();
-        let (ref mut receive_ptrs, ref mut wakers) = *guard;
-
-        // Get a pointer to the queue_head or cursor and see check for anything receivable.
-        let read_ptr = if receive_ptrs.cursor == NIL {
-            &self.core.nodes[receive_ptrs.queue_head]
-        } else {
-            &self.core.nodes[receive_ptrs.cursor]
-        };
-        let next_read_pos = (*read_ptr).next.load(Ordering::SeqCst);
-        if NIL == next_read_pos {
-            // Check to see if anyone can receive from the channel. If this receiver is the
-            // only thing holding the core then the sender is held by no one and no more messages
-            // can be received.
-            // FIXME Needs testing
-            if Arc::strong_count(&self.core) < 2 {
-                return Err(SeccErrors::EmptyNoSenders);
-            } else {
-                return Err(SeccErrors::Empty);
-            }
-        } else {
-            // We can read something so we will pull the item out of the read pointer.
-            let message: T = unsafe { (*(*read_ptr).cell.get()).take().unwrap() };
-
-            // Now we have to manage either pulling a node out of the middle if there was a
-            // cursor, or from the queue head if there was no cursor. Then we have to place
-            // the released node on the pool tail.
-            let pool_tail_ptr = &self.core.nodes[receive_ptrs.pool_tail];
-            (*read_ptr).next.store(NIL, Ordering::SeqCst);
-
-            let new_pool_tail = if receive_ptrs.cursor == NIL {
-                // If we aren't using a cursor then the queue_head becomes the pool tail
-                receive_ptrs.pool_tail = receive_ptrs.queue_head;
-                let old_queue_head = receive_ptrs.queue_head;
-                receive_ptrs.queue_head = next_read_pos;
-                old_queue_head
-            } else {
-                // If the cursor is set we have to dequeue in the middle of the list and fix the
-                // node chain and then move the node that the cursor was pointing at to the pool
-                // tail. Note that the `skipped` pointer will never be `NIL` when the cursor is
-                // not `NIL`. The `skipped` pointer is only ever set to a skipped node that
-                // could be read and lags beind `cursor` by one node in the queue.
-                let skipped_ptr = &self.core.nodes[receive_ptrs.skipped];
-                ((*skipped_ptr).next).store(next_read_pos, Ordering::SeqCst);
-                (*read_ptr).next.store(NIL, Ordering::SeqCst);
-                receive_ptrs.pool_tail = receive_ptrs.cursor;
-                let old_cursor = receive_ptrs.cursor;
-                receive_ptrs.cursor = next_read_pos;
-                old_cursor
-            };
-
-            // Update the channel metrics.
-            self.core.received.fetch_add(1, Ordering::SeqCst);
-            self.core.receivable.fetch_sub(1, Ordering::SeqCst);
-            self.core.pending.fetch_sub(1, Ordering::SeqCst);
-
-            // Finally add the new pool tail to the previous pool tail. We MUST set this
-            // LAST or we get into a race with the sender which would think that the node
-            // is available for sending when it actually isn't until just now.
-            (*pool_tail_ptr).next.store(new_pool_tail, Ordering::SeqCst);
-
-            // Call and remove all wakers.
-            for waker in wakers.drain(..) {
-                waker.wake();
-            }
-
-            // Notify anyone waiting on messages to be available.
-            condvar.notify_all();
-
-            // Return the message retreived earlier.
-            Ok(message)
-        }
-    }
-
     /// Removes the next receivable message in the channel and abandons it or returns an error
     /// if the channel was empty.
     pub fn pop(&self) -> Result<(), SeccErrors<T>> {
@@ -710,21 +706,23 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
 
     /// Creates a futures stream for receiving elements from the channel. The result of each
     /// iteration is either an item from the channel or an error.
-    pub fn stream(&self) -> SeccReceiverStream<T> {
+    ///
+    /// FIXME implement a stream for peeking.
+    pub fn receive_stream(&self) -> SeccReceiverStream<T> {
         SeccReceiverStream {
             receiver: self.clone(),
         }
     }
 
     /// A helper to call [`SeccReceiver::receive`] and await receivable messages until a message
-    /// is aailable or the specified timeout has expired.
+    /// is available or the specified timeout has expired.
     pub fn receive_await_timeout(&self, timeout: Duration) -> Result<T, SeccErrors<T>> {
         loop {
             match self.receive() {
                 Err(SeccErrors::Empty) => {
-                    let (ref mutex, condvar) = &*self.core.send_ptrs;
+                    let (ref mutex, _, has_data) = &*self.core.lock;
                     let guard = mutex.lock().unwrap();
-                    let (_, result) = condvar.wait_timeout(guard, timeout).unwrap();
+                    let (_, result) = has_data.wait_timeout(guard, timeout).unwrap();
                     self.core.awaited_capacity.fetch_add(1, Ordering::SeqCst);
                     if result.timed_out() {
                         // Try one more time in case we missed a Condvar notification.
@@ -753,15 +751,13 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
     /// messages the user will need to clear the skip cursor by calling the function `reset_skip`
     /// prior to calling `receive`.
     pub fn skip(&self) -> Result<(), SeccErrors<T>> {
-        // Retrieve receive pointers and the encoded indexes inside them.
-        let (ref mutex, _) = &*self.core.receive_ptrs;
-        let mut guard = mutex.lock().unwrap();
-        let (ref mut receive_ptrs, _) = *guard;
+        let (ref mutex, _, _) = &*self.core.lock;
+        let mut pointers = mutex.lock().unwrap();
 
-        let read_ptr = if receive_ptrs.cursor == NIL {
-            &self.core.nodes[receive_ptrs.queue_head]
+        let read_ptr = if pointers.cursor == NIL {
+            &self.core.nodes[pointers.queue_head]
         } else {
-            &self.core.nodes[receive_ptrs.cursor]
+            &self.core.nodes[pointers.cursor]
         };
         let next_read_pos = read_ptr.next.load(Ordering::SeqCst);
 
@@ -770,14 +766,14 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
         if NIL == next_read_pos {
             return Err(SeccErrors::Empty);
         }
-        if receive_ptrs.cursor == NIL {
+        if pointers.cursor == NIL {
             // There is no current cursor so we need to establish one.
-            receive_ptrs.skipped = receive_ptrs.queue_head;
-            receive_ptrs.cursor = next_read_pos;
+            pointers.skipped = pointers.queue_head;
+            pointers.cursor = next_read_pos;
         } else {
             // There is a cursor already so make sure we increment `cursor` and `skipped`.
-            receive_ptrs.skipped = receive_ptrs.cursor;
-            receive_ptrs.cursor = next_read_pos;
+            pointers.skipped = pointers.cursor;
+            pointers.cursor = next_read_pos;
         }
         self.core.receivable.fetch_sub(1, Ordering::SeqCst);
         Ok(())
@@ -787,28 +783,26 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
     /// to `NIL` allowing previously skipped messages to be received. Note that calling this
     /// method on a channel with no skip cursor will do nothing.
     pub fn reset_skip(&self) -> Result<(), SeccErrors<T>> {
-        // Retrieve receive pointers and the encoded indexes inside them.
-        let (ref mutex, condvar) = &*self.core.receive_ptrs;
-        let mut guard = mutex.lock().unwrap();
-        let (ref mut receive_ptrs, _) = *guard;
+        let (ref mutex, _, has_data) = &*self.core.lock;
+        let mut pointers = mutex.lock().unwrap();
 
-        if receive_ptrs.cursor != NIL {
+        if pointers.cursor != NIL {
             // We start from queue head and count to the cursor to get the new number of currently
             // receivable messages in the channel.
             let mut count: usize = 1; // Minimum number of skipped nodes.
-            let mut next_ptr = self.core.nodes[receive_ptrs.queue_head]
+            let mut next_ptr = self.core.nodes[pointers.queue_head]
                 .next
                 .load(Ordering::SeqCst);
-            while next_ptr != receive_ptrs.cursor {
+            while next_ptr != pointers.cursor {
                 count += 1;
                 next_ptr = self.core.nodes[next_ptr].next.load(Ordering::SeqCst);
             }
             self.core.receivable.fetch_add(count, Ordering::SeqCst);
-            receive_ptrs.cursor = NIL;
-            receive_ptrs.skipped = NIL;
+            pointers.cursor = NIL;
+            pointers.skipped = NIL;
         }
         // Notify anyone waiting for receivable messages to be available.
-        condvar.notify_all();
+        has_data.notify_all();
         Ok(())
     }
 
@@ -840,9 +834,7 @@ impl<T: Sync + Send + Clone> SeccCoreOps<T> for SeccReceiver<T> {
 /// if they are doing so in a different order.
 impl<T: Sync + Send + Clone> fmt::Debug for SeccReceiver<T> {
     fn fmt(&self, formatter: &'_ mut fmt::Formatter) -> fmt::Result {
-        let (ref mutex, _) = &*self.core.receive_ptrs;
-        let receive_ptrs = mutex.lock().unwrap();
-        write!(formatter, "{}", self.debug_locked(&receive_ptrs))
+        write!(formatter, "{}", self.debug_structure())
     }
 }
 
@@ -883,17 +875,16 @@ pub fn create<T: Sync + Send + Clone>(
         pool_head = nodes.len() - 1;
     }
 
-    // Materialize the starting indexes for both send and receive.
-    let send_ptrs = SeccSendPtrs {
+    // Package all of the pointers.
+    let pointers = SeccPointers {
         queue_tail,
         pool_head,
-    };
-
-    let receive_ptrs = SeccReceivePtrs {
         queue_head,
         pool_tail,
         skipped: NIL,
         cursor: NIL,
+        send_wakers: None,
+        receive_wakers: None,
     };
 
     // Create the channel structures.
@@ -901,10 +892,7 @@ pub fn create<T: Sync + Send + Clone>(
         capacity: capacity as usize,
         poll_timeout,
         nodes: nodes.into_boxed_slice(),
-        // FIXME create a sane default for vec size or let user configure.
-        send_ptrs: Arc::new((Mutex::new((send_ptrs, Vec::new())), Condvar::new())),
-        // FIXME create a sane default for vec size or let user configure.
-        receive_ptrs: Arc::new((Mutex::new((receive_ptrs, Vec::new())), Condvar::new())),
+        lock: Arc::new((Mutex::new(pointers), Condvar::new(), Condvar::new())),
         awaited_messages: AtomicUsize::new(0),
         awaited_capacity: AtomicUsize::new(0),
         pending: AtomicUsize::new(0),
@@ -942,41 +930,36 @@ mod tests {
             $cursor:expr
         ) => {{
             let actual = debug_channel($sender.clone(), $receiver.clone());
-            let (ref mutex, _) = &*$sender.core.send_ptrs;
-            let mut send_guard = mutex.lock().unwrap();
-            let (ref mut send_ptrs, _) = *send_guard;
-
-            let (ref mutex, _) = &*$receiver.core.receive_ptrs;
-            let mut receive_guard = mutex.lock().unwrap();
-            let (ref mut receive_ptrs, _) = *receive_guard;
+            let (ref mutex, _, _) = &*$sender.core.lock;
+            let pointers = mutex.lock().unwrap();
 
             assert_eq!(
-                $queue_head, receive_ptrs.queue_head,
+                $queue_head, pointers.queue_head,
                 " <== queue_head mismatch!\n Actual: {}\n",
                 actual
             );
             assert_eq!(
-                $queue_tail, send_ptrs.queue_tail,
+                $queue_tail, pointers.queue_tail,
                 "<== queue_tail mismatch\n Actual: {}\n",
                 actual
             );
             assert_eq!(
-                $pool_head, send_ptrs.pool_head,
+                $pool_head, pointers.pool_head,
                 "<== pool_head mismatch\n Actual: {}\n",
                 actual
             );
             assert_eq!(
-                $pool_tail, receive_ptrs.pool_tail,
+                $pool_tail, pointers.pool_tail,
                 " <== pool_tail mismatch\n Actual: {}\n",
                 actual
             );
             assert_eq!(
-                $skipped, receive_ptrs.skipped,
+                $skipped, pointers.skipped,
                 " <== skipped mismatch\n Actual: {}\n",
                 actual
             );
             assert_eq!(
-                $cursor, receive_ptrs.cursor,
+                $cursor, pointers.cursor,
                 " <== cursor mismatch\n Actual: {}\n",
                 actual
             );
@@ -1802,27 +1785,35 @@ mod tests {
 
     #[test]
     fn test_async_send_to_full_channel() {
-        use futures::executor::block_on;
+        use futures::executor::LocalPool;
+        use futures::task::LocalSpawnExt;
+
         let (sender, receiver) = create::<i32>(1, Duration::from_millis(1));
+        sender.send(5).unwrap();
+
+        // Sending to a full channel should work after first message is received.
+        let mut pool = LocalPool::new();
+        let mut spawner = pool.spawner();
+        spawner
+            .spawn_local(async move {
+                sender.async_send(17).await.unwrap();
+            })
+            .unwrap();
+        pool.try_run_one();
 
         let handle = thread::spawn(move || {
             println!("receiving first");
             match receiver.receive_await_timeout(Duration::from_millis(10)) {
-                Ok(_) => (),
+                Ok(_) => println!("====> Got First Message"),
                 Err(e) => panic!("Receive returned: {}", e),
             }
             println!("receiving second");
             // Receive the second message sent by future.
             match receiver.receive_await_timeout(Duration::from_millis(10)) {
-                Ok(_) => (),
+                Ok(_) => println!("====> Got Second Message"),
                 Err(e) => panic!("Receive returned: {}", e),
             }
         });
-
-        sender.send(5).unwrap();
-
-        // Sending to a full channel should work after first message is received.
-        block_on(sender.async_send(17)).unwrap();
 
         handle.join().unwrap();
     }
