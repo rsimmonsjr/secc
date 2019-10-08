@@ -335,12 +335,10 @@ impl<T: Sync + Send + Clone> Future for SeccSendFuture<T> {
     type Output = Result<(), SeccErrors<T>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        println!("====> POLLING FUTURE");
         let value = self.value.take().unwrap();
         match self.sender.send_internal(value, Some(cx.waker().clone())) {
             result @ Ok(_) => Poll::Ready(result),
             Err(SeccErrors::Full(returned_value)) => {
-                println!("====> CHANNEL FULL");
                 // Value is moved so the full will return it to us, we will store it back.
                 self.value = Some(returned_value);
                 Poll::Pending
@@ -393,7 +391,6 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
         let pool_head_ptr = &self.core.nodes[pointers.pool_head];
         let next_pool_head = pool_head_ptr.next.load(Ordering::SeqCst);
         if NIL == next_pool_head {
-            println!("Registering send waker");
             if let Some(w) = waker {
                 if let Some(ref mut wakers) = pointers.send_wakers {
                     wakers.push(w);
@@ -438,9 +435,7 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
 
             // Call any potential wakers.
             if let Some(mut wakers) = wakers_opt {
-                println!("====> receive wakers: {}", wakers.len());
                 for waker in wakers.drain(..) {
-                    println!("====> calling receive waker");
                     waker.wake();
                 }
             }
@@ -452,7 +447,6 @@ impl<T: Sync + Send + Clone> SeccSender<T> {
     /// Returns a future for sending to the channel. The future will attempt to send to the channel
     /// on each poll and will be awoken when space opens up in the channel.
     pub fn async_send(&self, value: T) -> SeccSendFuture<T> {
-        println!("====> CREATING FUTURE");
         SeccSendFuture::new(value, self.clone())
     }
 
@@ -636,9 +630,7 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
 
             // Call and remove all wakers.
             if let Some(mut wakers) = wakers_opt {
-                println!("====> send wakers count {}", wakers.len());
                 for waker in wakers.drain(..) {
-                    println!("====> calling send waker");
                     waker.wake();
                 }
             }
@@ -1692,13 +1684,14 @@ mod tests {
 
     /// A helper for creating tests with multiple senders and receivers.
     fn multiple_thread_helper<T: Sync + Send + Clone + 'static>(
+        channel_size: u16,
         receiver_count: u8,
         sender_count: u8,
         message_count: usize,
         time_limit: Duration,
         message: T,
     ) {
-        let (sender, receiver) = create::<T>(10, Duration::from_millis(1));
+        let (sender, receiver) = create::<T>(channel_size, Duration::from_millis(1));
         let pair = Arc::new((Mutex::new(false), Condvar::new()));
         let total_thread_count: usize = receiver_count as usize + sender_count as usize;
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(total_thread_count);
@@ -1749,19 +1742,21 @@ mod tests {
     /// Tests channel under multiple receivers and a single sender.
     #[test]
     fn test_multiple_receiver_single_sender() {
-        multiple_thread_helper(2, 1, 10_000, Duration::from_millis(1000), 7 as u32);
+        multiple_thread_helper(10, 2, 1, 10_000, Duration::from_millis(1000), 7 as u32);
     }
 
     /// Tests channel under multiple senders and a single receiver.
     #[test]
     fn test_multiple_sender_single_receiver() {
-        multiple_thread_helper(1, 3, 10_000, Duration::from_millis(1000), 7 as u32);
+        multiple_thread_helper(10, 1, 3, 10_000, Duration::from_millis(1000), 7 as u32);
     }
 
     /// Tests channel under multiple receivers and a multiple senders.
     #[test]
     fn test_multiple_receiver_multiple_sender() {
-        multiple_thread_helper(3, 3, 10_000, Duration::from_millis(1000), 7 as u32);
+        let start = Instant::now();
+        multiple_thread_helper(10, 3, 3, 1_000_000, Duration::from_millis(10000), 7 as u32);
+        println!("Took: {:?}", Instant::elapsed(&start))
     }
 
     #[test]
