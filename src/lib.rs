@@ -510,6 +510,29 @@ unsafe impl<T: Send + Sync + Clone> Send for SeccSender<T> {}
 
 unsafe impl<T: Send + Sync + Clone> Sync for SeccSender<T> {}
 
+/// A stream that peeks at messages from the channel as they become available. It should be noted
+/// that sucessive polling of this stream will produce the same value, since it is beeing peeked
+/// and not removed, unless something pops the message off of the channel between peeks. A typical
+/// use of this would be to peek at the values, decide what to do and then pop the values.
+pub struct SeccPeekStream<T: Send + Sync + Clone> {
+    /// This is the receiver that this stream will use for items comming off of the channel.
+    receiver: SeccReceiver<T>,
+}
+
+impl<T: Send + Sync + Clone> Stream for SeccPeekStream<T> {
+    // FIXME Separate SeccErrors into two enums, one for sending and one for receiving.
+    type Item = Result<T, SeccErrors<T>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.receiver.peek_internal(Some(cx.waker().clone())) {
+            result @ Ok(_) => Poll::Ready(Some(result)),
+            Err(SeccErrors::Empty) => Poll::Pending,
+            error @ Err(SeccErrors::EmptyNoSenders) => Poll::Ready(Some(error)),
+            error @ Err(_) => Poll::Ready(Some(error)),
+        }
+    }
+}
+
 /// A stream that receives messages from the channel as they become available.
 pub struct SeccReceiverStream<T: Send + Sync + Clone> {
     /// This is the receiver that this stream will use for items comming off of the channel.
@@ -517,7 +540,7 @@ pub struct SeccReceiverStream<T: Send + Sync + Clone> {
 }
 
 impl<T: Send + Sync + Clone> Stream for SeccReceiverStream<T> {
-    // FIXME Separate SeccErrors into two enums.
+    // FIXME Separate SeccErrors into two enums, one for sending and one for receiving.
     type Item = Result<T, SeccErrors<T>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -698,14 +721,22 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
 
     /// Creates a futures stream for receiving elements from the channel. The result of each
     /// iteration is either an item from the channel or an error.
-    ///
-    /// FIXME implement a stream for peeking.
     pub fn receive_stream(&self) -> SeccReceiverStream<T> {
         SeccReceiverStream {
             receiver: self.clone(),
         }
     }
 
+    /// Creates a futures stream for peeking at elements from the channel. The result of each
+    /// iteration is either an item from the channel or an error. Note that this iterator does not
+    /// change the channel so calling `next` will produce the same value unless something else has
+    /// altered the channel by popping or receiving a message.
+    pub fn peek_stream(&self) -> SeccPeekStream<T> {
+        SeccPeekStream {
+            receiver: self.clone(),
+        }
+    }
+    
     /// A helper to call [`SeccReceiver::receive`] and await receivable messages until a message
     /// is available or the specified timeout has expired.
     pub fn receive_await_timeout(&self, timeout: Duration) -> Result<T, SeccErrors<T>> {
@@ -905,6 +936,10 @@ pub fn create<T: Sync + Send + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
+    use futures::executor::ThreadPool;
+    use futures::stream::StreamExt;
+    use futures::task::SpawnExt;
     use std::thread;
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
@@ -1755,13 +1790,12 @@ mod tests {
     #[test]
     fn test_multiple_receiver_multiple_sender() {
         let start = Instant::now();
-        multiple_thread_helper(10, 3, 3, 1_000_000, Duration::from_millis(10000), 7 as u32);
-        println!("Took: {:?}", Instant::elapsed(&start))
+        multiple_thread_helper(100, 3, 3, 100_000, Duration::from_millis(10000), 7 as u32);
+        println!("Took {:?} to send 100k messages", Instant::elapsed(&start));
     }
 
     #[test]
     fn test_async_send_to_empty_channel() {
-        use futures::executor::block_on;
         let (sender, receiver) = create::<i32>(1, Duration::from_millis(1));
 
         // Sending to an empty channel should work.
@@ -1780,36 +1814,80 @@ mod tests {
 
     #[test]
     fn test_async_send_to_full_channel() {
-        use futures::executor::LocalPool;
-        use futures::task::LocalSpawnExt;
-
+        let pool = ThreadPool::new().unwrap();
         let (sender, receiver) = create::<i32>(1, Duration::from_millis(1));
         sender.send(5).unwrap();
 
         // Sending to a full channel should work after first message is received.
-        let mut pool = LocalPool::new();
-        let mut spawner = pool.spawner();
-        spawner
-            .spawn_local(async move {
-                sender.async_send(17).await.unwrap();
-            })
-            .unwrap();
-        pool.try_run_one();
+        pool.spawn_ok(async move {
+            sender.async_send(17).await.unwrap();
+        });
 
         let handle = thread::spawn(move || {
-            println!("receiving first");
             match receiver.receive_await_timeout(Duration::from_millis(10)) {
-                Ok(_) => println!("====> Got First Message"),
+                Ok(_) => (),
                 Err(e) => panic!("Receive returned: {}", e),
             }
-            println!("receiving second");
             // Receive the second message sent by future.
             match receiver.receive_await_timeout(Duration::from_millis(10)) {
-                Ok(_) => println!("====> Got Second Message"),
+                Ok(_) => (),
                 Err(e) => panic!("Receive returned: {}", e),
             }
         });
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_async_receive_stream() {
+        let mut pool = ThreadPool::new().unwrap();
+        let (sender, receiver) = create::<i32>(5, Duration::from_millis(1));
+        sender.send(3).unwrap();
+        sender.send(5).unwrap();
+
+        let handle = pool
+            .spawn_with_handle(async move {
+                let mut stream = receiver.receive_stream();
+                assert_eq!(stream.next().await, Some(Ok(3)));
+                assert_eq!(stream.next().await, Some(Ok(5)));
+                assert_eq!(stream.next().await, Some(Ok(7)));
+                assert_eq!(stream.next().await, Some(Ok(11)));
+            })
+            .unwrap();
+
+        thread::sleep(Duration::from_millis(100));
+
+        sender.send(7).unwrap();
+        sender.send(11).unwrap();
+        block_on(handle);
+    }
+
+    #[test]
+    fn test_async_peek_stream() {
+        let mut pool = ThreadPool::new().unwrap();
+        let (sender, receiver) = create::<i32>(5, Duration::from_millis(1));
+        sender.send(3).unwrap();
+        sender.send(5).unwrap();
+
+        let handle = pool
+            .spawn_with_handle(async move {
+                let mut stream = receiver.peek_stream();
+                assert_eq!(stream.next().await, Some(Ok(3)));
+                assert_eq!(stream.next().await, Some(Ok(3)));
+                receiver.pop().unwrap();
+                assert_eq!(stream.next().await, Some(Ok(5)));
+                assert_eq!(stream.next().await, Some(Ok(5)));
+                receiver.pop().unwrap();
+                assert_eq!(stream.next().await, Some(Ok(7)));
+                receiver.pop().unwrap();
+                assert_eq!(stream.next().await, Some(Ok(11)));
+            })
+            .unwrap();
+
+        thread::sleep(Duration::from_millis(100));
+
+        sender.send(7).unwrap();
+        sender.send(11).unwrap();
+        block_on(handle);
     }
 }
