@@ -41,5 +41,6 @@ maintenance = { status = "actively-developed" }
 [dev-dependencies]
 
 [dependencies]
+# FIXME Remove when all used features of futures are in Stable.
 futures-preview = { version = "0.3.0-alpha.19", features = ["async-await"] }
 

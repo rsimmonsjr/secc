@@ -57,6 +57,10 @@
 //!
 //! ### What's New
 //!
+//! * 2019-??-??: 0.1.0-BETA
+//!   * Added `async_send`, `receive_stream` and `peek_stream` functions which use Rust futures,
+//!   now in beta. Until those features end up in stable `master` branch will require you build
+//!   with the beta toolset. i.e. cargo +beta build.
 //! * 2019-09-13: 0.0.10
 //!   * Issue #13: A Deadlock would occur if the timeout occurred while waiting for space or data.
 //!   * BREAKING CHANGE Timeouts are in `Duration` objects now rather than milliseconds.
@@ -68,16 +72,14 @@
 //! ### Design Principals
 //!
 //! SECC was driven by the need for a multi-sender, multi-consumer channel that would have the
-//! ability to skip processing messages. There are many situation in which this is needed by a
+//! ability to skip processing messages. There are many situations in which this is needed by a
 //! consumer such as the use case with Axiom where actors implement a finite state machine. That
 //! led me to go through many iterations of different designs until it became clear that a linked
 //! list was the only legitimate approach. The problem with a linked lists is that they typically
 //! burn a lot of CPU time in allocating new nodes on each enqueue. The solution was to use two
 //! linked lists, allocate all nodes up front and just logically move nodes around. The actual
 //! pointers to the next node or the various heads and tails are the indexes in the statically
-//! allocated slice of nodes. When send and receive operations happen, nodes are merely moved
-//! around logically but not physically.
-//!
+//! allocated slice of nodes.
 
 use futures::stream::Stream;
 use futures::task::Waker;
@@ -98,12 +100,12 @@ const NIL: usize = 1 << 16 as usize;
 /// Errors potentially returned from channel operations.
 #[derive(Eq, PartialEq)]
 pub enum SeccErrors<T: Sync + Send + Clone> {
-    /// Channel is full, no more messages can be sent, the enclosed message contains the last
-    /// message attempted to be sent.
+    /// Channel is full, no more messages can be sent, the enclosed value is the last message
+    /// attempted to be sent.
     Full(T),
 
     /// There are no more possible receivers to the channel so sending data would be pointless.
-    /// The element of the tuple is the message that was to be sent.
+    /// The element of the tuple in this error is the message that was attempted to be sent.
     NoReceivers(T),
 
     /// Channel is empty so no more messages can be received. This can also be returned if there
@@ -112,7 +114,7 @@ pub enum SeccErrors<T: Sync + Send + Clone> {
     Empty,
 
     /// Channel is empty and there is no chance of any other process sending to the channel
-    /// since no one is holding the sender anymore.
+    /// since no one is holding the sender anymore so receive is impossible.
     EmptyNoSenders,
 }
 
@@ -210,7 +212,7 @@ pub trait SeccCoreOps<T: Sync + Send + Clone> {
         self.core().received.load(Ordering::Relaxed)
     }
 
-    /// Creates a debug string for diagnosing problems with the send side of the channel.
+    /// Creates a debug string for diagnosing problems with the channel.
     fn debug_structure(&self) -> String {
         let (ref mutex, _, _) = &*self.core().lock;
         let pointers = mutex.lock().unwrap();
@@ -262,7 +264,7 @@ struct SeccPointers {
     /// Note that if there is only one node in the pool then the channel is full as neither the
     /// pool nor queue may be empty.
     pool_head: usize,
-    /// The head of the queue which holds messages currently in the channel.  Note that if there
+    /// The head of the queue which holds messages currently in the channel. Note that if there
     /// is only one node in the queue then the channel is empty as neither the pool nor queue
     /// may be empty.
     queue_head: usize,
@@ -292,7 +294,7 @@ pub struct SeccCore<T: Sync + Send + Clone> {
     /// Storage of the nodes.
     nodes: Box<[SeccNode<T>]>,
     /// This is the lock that is used for channel operations as well as condvars for both
-    /// has_capacity and has_data respectively, that will be used to signal changes in the channel.
+    /// has_capacity and has_messages in that order.
     lock: Arc<(Mutex<SeccPointers>, Condvar, Condvar)>,
     /// Count of the number of times receivers of this channel waited for messages.
     awaited_messages: AtomicUsize,
@@ -339,7 +341,6 @@ impl<T: Sync + Send + Clone> Future for SeccSendFuture<T> {
         match self.sender.send_internal(value, Some(cx.waker().clone())) {
             result @ Ok(_) => Poll::Ready(result),
             Err(SeccErrors::Full(returned_value)) => {
-                // Value is moved so the full will return it to us, we will store it back.
                 self.value = Some(returned_value);
                 Poll::Pending
             }
@@ -499,7 +500,6 @@ impl<T: Sync + Send + Clone> SeccCoreOps<T> for SeccSender<T> {
     }
 }
 
-/// This function will write a debug string for the `SeccSender`.
 impl<T: Sync + Send + Clone> fmt::Debug for SeccSender<T> {
     fn fmt(&self, formatter: &'_ mut fmt::Formatter) -> fmt::Result {
         write!(formatter, "{}", self.debug_structure())
@@ -511,16 +511,16 @@ unsafe impl<T: Send + Sync + Clone> Send for SeccSender<T> {}
 unsafe impl<T: Send + Sync + Clone> Sync for SeccSender<T> {}
 
 /// A stream that peeks at messages from the channel as they become available. It should be noted
-/// that sucessive polling of this stream will produce the same value, since it is beeing peeked
+/// that successive polling of this stream will produce the same value, since it is being peeked
 /// and not removed, unless something pops the message off of the channel between peeks. A typical
-/// use of this would be to peek at the values, decide what to do and then pop the values.
+/// use of this would be to peek at the message, decide what to do and then pop or skip the
+/// message.
 pub struct SeccPeekStream<T: Send + Sync + Clone> {
-    /// This is the receiver that this stream will use for items comming off of the channel.
+    /// This is the receiver that this stream will use for items coming off of the channel.
     receiver: SeccReceiver<T>,
 }
 
 impl<T: Send + Sync + Clone> Stream for SeccPeekStream<T> {
-    // FIXME Separate SeccErrors into two enums, one for sending and one for receiving.
     type Item = Result<T, SeccErrors<T>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -535,12 +535,11 @@ impl<T: Send + Sync + Clone> Stream for SeccPeekStream<T> {
 
 /// A stream that receives messages from the channel as they become available.
 pub struct SeccReceiverStream<T: Send + Sync + Clone> {
-    /// This is the receiver that this stream will use for items comming off of the channel.
+    /// This is the receiver that this stream will use for items coming off of the channel.
     receiver: SeccReceiver<T>,
 }
 
 impl<T: Send + Sync + Clone> Stream for SeccReceiverStream<T> {
-    // FIXME Separate SeccErrors into two enums, one for sending and one for receiving.
     type Item = Result<T, SeccErrors<T>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -585,7 +584,7 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
         let (ref mutex, has_capacity, _) = &*self.core.lock;
         let mut pointers = mutex.lock().unwrap();
 
-        // Get a pointer to the queue_head or cursor and see check for anything receivable.
+        // Get a pointer to the queue_head or cursor and checks for anything receivable.
         let read_ptr = if pointers.cursor == NIL {
             &self.core.nodes[pointers.queue_head]
         } else {
@@ -595,7 +594,7 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
         if NIL == next_read_pos {
             // Check to see if anyone can receive from the channel. If this receiver is the only
             // thing holding the core then the sender is held by no one and no more messages can
-            // enter the channel so we will only receive if there are pending messages.
+            // enter the channel and an error will be returned.
             // FIXME Needs testing
             if Arc::strong_count(&self.core) < 2 {
                 return Err(SeccErrors::EmptyNoSenders);
@@ -630,7 +629,7 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
                 // node chain and then move the node that the cursor was pointing at to the pool
                 // tail. Note that the `skipped` pointer will never be `NIL` when the cursor is
                 // not `NIL`. The `skipped` pointer is only ever set to a skipped node that
-                // could be read and lags beind `cursor` by one node in the queue.
+                // could be read and lags behind `cursor` by one node in the queue.
                 let skipped_ptr = &self.core.nodes[pointers.skipped];
                 ((*skipped_ptr).next).store(next_read_pos, Ordering::SeqCst);
                 (*read_ptr).next.store(NIL, Ordering::SeqCst);
@@ -661,15 +660,15 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
             // Notify anyone waiting on messages to be available.
             has_capacity.notify_all();
 
-            // Return the message retreived earlier.
+            // Return the message retrieved earlier.
             Ok(message)
         }
     }
 
     /// Peeks at the next receivable message in the channel and returns a `Clone` of the message.
     /// Note that the message isn't guaranteed to stay in the channel as a thread could pop the
-    /// message off while another thread is looking at the value but the value shouldn't change
-    /// under the peeking thread.
+    /// message off while another thread is looking at the message but the message won't change
+    /// from the point of view of the peeking thread if it is popped off the channel.
     pub fn peek(&self) -> Result<T, SeccErrors<T>> {
         self.peek_internal(None)
     }
@@ -680,7 +679,7 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
         let (ref mutex, _, _) = &*self.core.lock;
         let mut pointers = mutex.lock().unwrap();
 
-        // Get a pointer to the queue_head or cursor and see check for anything receivable.
+        // Get a pointer to the queue_head or cursor and check for anything receivable.
         let read_ptr = if pointers.cursor == NIL {
             &self.core.nodes[pointers.queue_head]
         } else {
@@ -736,7 +735,7 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
             receiver: self.clone(),
         }
     }
-    
+
     /// A helper to call [`SeccReceiver::receive`] and await receivable messages until a message
     /// is available or the specified timeout has expired.
     pub fn receive_await_timeout(&self, timeout: Duration) -> Result<T, SeccErrors<T>> {
@@ -805,6 +804,8 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
     /// Cancels skipping messages in the channel and resets the `skipped` and `cursor` pointers
     /// to `NIL` allowing previously skipped messages to be received. Note that calling this
     /// method on a channel with no skip cursor will do nothing.
+    ///
+    /// FIXME Create test to make sure that when the skip is reset receive wakers will be called. 
     pub fn reset_skip(&self) -> Result<(), SeccErrors<T>> {
         let (ref mutex, _, has_data) = &*self.core.lock;
         let mut pointers = mutex.lock().unwrap();
@@ -825,7 +826,21 @@ impl<T: Sync + Send + Clone> SeccReceiver<T> {
             pointers.skipped = NIL;
         }
         // Notify anyone waiting for receivable messages to be available.
+        let wakers_opt = pointers.receive_wakers.take();
+
+        // End of critical block so drop the lock.
+        drop(pointers);
+
+        // Call and remove all wakers.
+        if let Some(mut wakers) = wakers_opt {
+            for waker in wakers.drain(..) {
+                waker.wake();
+            }
+        }
+
+        // Notify condvar waiters.
         has_data.notify_all();
+
         Ok(())
     }
 
@@ -851,10 +866,7 @@ impl<T: Sync + Send + Clone> SeccCoreOps<T> for SeccReceiver<T> {
     }
 }
 
-/// This function will write a debug string for the `SeccReceiver` but be warned that it will
-/// acquire the mutex lock to the `receive_ptrs` to accomplish this so a deadlock could ensue
-/// if you have two threads asking for debug on both `SeccSender` and `SeccReceiver`, especially
-/// if they are doing so in a different order.
+/// This function will write a debug string for the `SeccReceiver`.
 impl<T: Sync + Send + Clone> fmt::Debug for SeccReceiver<T> {
     fn fmt(&self, formatter: &'_ mut fmt::Formatter) -> fmt::Result {
         write!(formatter, "{}", self.debug_structure())
@@ -1794,6 +1806,7 @@ mod tests {
         println!("Took {:?} to send 100k messages", Instant::elapsed(&start));
     }
 
+    /// Tests that sending using a future to an empty channel works properly. 
     #[test]
     fn test_async_send_to_empty_channel() {
         let (sender, receiver) = create::<i32>(1, Duration::from_millis(1));
@@ -1812,6 +1825,7 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// Tests that sending using a future to an full channel works properly. 
     #[test]
     fn test_async_send_to_full_channel() {
         let pool = ThreadPool::new().unwrap();
@@ -1838,6 +1852,7 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// Tests the functionality of a futures-based receive stream.
     #[test]
     fn test_async_receive_stream() {
         let mut pool = ThreadPool::new().unwrap();
@@ -1862,6 +1877,7 @@ mod tests {
         block_on(handle);
     }
 
+    /// Tests the functionality of a futures-based peek stream.
     #[test]
     fn test_async_peek_stream() {
         let mut pool = ThreadPool::new().unwrap();

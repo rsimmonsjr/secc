@@ -1,5 +1,12 @@
 # Release Notes
 
+* 2019-??-??: 0.1.0-BETA
+  * Added `async_send`, `receive_stream` and `peek_stream` functions which use Rust futures,
+  now in beta. Until those features end up in stable `master` branch will require you build
+  with the beta toolset. i.e. cargo +beta build.
+* 2019-09-13: 0.0.10
+  * Issue #13: A Deadlock would occur if the timeout occurred while waiting for space or data.
+  * BREAKING CHANGE Timeouts are in `Duration` objects now rather than milliseconds.
 * 2019-08-18: 0.0.9
   * Most `unsafe` code has been eliminated, enhancing stability.
   * Fix to Issue #10 involving a SEGFAULT.

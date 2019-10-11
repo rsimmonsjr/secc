@@ -1,3 +1,4 @@
+
 # Skip Enabled Concurrent Channel for Rust (SECC)
 
 [![Latest version](https://img.shields.io/crates/v/secc.svg)](https://crates.io/crates/secc)
@@ -57,6 +58,10 @@ the middle of the channel, reset the skip and resume receiving normally.
 
 ### What's New
 
+* 2019-??-??: 0.1.0-BETA
+  * Added `async_send`, `receive_stream` and `peek_stream` functions which use Rust futures,
+  now in beta. Until those features end up in stable `master` branch will require you build
+  with the beta toolset. i.e. cargo +beta build.
 * 2019-09-13: 0.0.10
   * Issue #13: A Deadlock would occur if the timeout occurred while waiting for space or data.
   * BREAKING CHANGE Timeouts are in `Duration` objects now rather than milliseconds.
@@ -68,14 +73,11 @@ the middle of the channel, reset the skip and resume receiving normally.
 ### Design Principals
 
 SECC was driven by the need for a multi-sender, multi-consumer channel that would have the
-ability to skip processing messages. There are many situation in which this is needed by a
+ability to skip processing messages. There are many situations in which this is needed by a
 consumer such as the use case with Axiom where actors implement a finite state machine. That
 led me to go through many iterations of different designs until it became clear that a linked
 list was the only legitimate approach. The problem with a linked lists is that they typically
 burn a lot of CPU time in allocating new nodes on each enqueue. The solution was to use two
 linked lists, allocate all nodes up front and just logically move nodes around. The actual
 pointers to the next node or the various heads and tails are the indexes in the statically
-allocated slice of nodes. When send and receive operations happen, nodes are merely moved
-around logically but not physically.
-
-
+allocated slice of nodes.
