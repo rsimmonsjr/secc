@@ -58,10 +58,12 @@ the middle of the channel, reset the skip and resume receiving normally.
 
 ### What's New
 
-* 2019-??-??: 0.1.0-BETA
+* 2019-??-??: 0.1.0-beta1
+  * This build requires Rust 1.39.0 which is in beta at the time of publishing; you can build 
+  with `cargo +beta build`. 
   * Added `async_send`, `receive_stream` and `peek_stream` functions which use Rust futures,
   now in beta. Until those features end up in stable `master` branch will require you build
-  with the beta toolset. i.e. cargo +beta build.
+  with the beta toolchain.
 * 2019-09-13: 0.0.10
   * Issue #13: A Deadlock would occur if the timeout occurred while waiting for space or data.
   * BREAKING CHANGE Timeouts are in `Duration` objects now rather than milliseconds.
